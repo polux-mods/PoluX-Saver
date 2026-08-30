@@ -31,6 +31,13 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 PORT = int(os.getenv("PORT", "10000"))
 
+# Local Node.js + BgUtils PO-token provider paths prepared by build.sh
+BASE_DIR = Path(__file__).resolve().parent
+LOCAL_NODE_BIN = BASE_DIR / ".node" / "bin"
+BGUTIL_SCRIPT = BASE_DIR / "bgutil-ytdlp-pot-provider" / "server" / "build" / "generate_once.js"
+if LOCAL_NODE_BIN.is_dir():
+    os.environ["PATH"] = str(LOCAL_NODE_BIN) + os.pathsep + os.environ.get("PATH", "")
+
 MAX_FILE_SIZE = 49 * 1024 * 1024
 MAX_PLAYLIST_ITEMS = 15
 
@@ -60,12 +67,15 @@ def youtube_options_base():
         },
         "extractor_args": {
             "youtube": {
-                # Prefer clients that currently have fewer PO-token
-                # requirements on a headless server. yt-dlp may still fall
-                # back internally when one client has no usable formats.
-                "player_client": ["android_vr", "web_safari", "tv"],
-            }
+                # mweb is the client recommended by yt-dlp when a PO-token
+                # provider is installed. The provider plugin supplies tokens
+                # automatically per video.
+                "player_client": ["mweb", "android_vr", "web_safari", "tv"],
+                "player_skip": ["webpage", "configs"],
+            },
         },
+        # yt-dlp will auto-discover bgutil-ytdlp-pot-provider when installed.
+        # Enable the external provider if a Render service URL is supplied.
     }
 
     if YOUTUBE_COOKIES:
@@ -74,6 +84,16 @@ def youtube_options_base():
             options["cookiefile"] = str(cookie_path)
         else:
             logger.warning("YOUTUBE_COOKIES is set but file does not exist: %s", cookie_path)
+
+    # Use the local BgUtils script provider built during Render deployment.
+    # This generates PO tokens automatically for the video being requested.
+    if BGUTIL_SCRIPT.is_file():
+        options["extractor_args"]["youtubepot-bgutilscript"] = {
+            "script_path": str(BGUTIL_SCRIPT)
+        }
+        options["js_runtimes"] = {"node": str(LOCAL_NODE_BIN / "node")}
+    else:
+        logger.warning("BgUtils provider script not found: %s", BGUTIL_SCRIPT)
 
     return options
 
