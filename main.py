@@ -1021,22 +1021,14 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
 
-    logger.info(
-        "Shutting down..."
-    )
+    logger.info("Shutting down Telegram application...")
 
     try:
-
-        await telegram_app.bot.delete_webhook(
-            drop_pending_updates=False
-        )
-
-    finally:
-
         await telegram_app.stop()
-
+    finally:
         await telegram_app.shutdown()
 
+    logger.info("Telegram application stopped.")
 
 # =========================================================
 # RUN
