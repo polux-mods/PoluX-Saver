@@ -1,35 +1,28 @@
 import os
 import asyncio
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-import yt_dlp
 
-# Ваш токен від BotFather
 TOKEN = "8787993439:AAFeVmWBRiVvMAlpO4SCnd3mT1Hlohkajxk"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привіт! Надішли мені посилання на відео, трек або плейлист з YouTube / YouTube Music 🎵🎬")
+    await update.message.reply_text("Привіт! Надішли мені посилання на YouTube або YouTube Music (відео, трек або плейлист) 🎵🎬")
 
 async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-    
     if not (url.startswith("http://") or url.startswith("https://")):
         await update.message.reply_text("❌ Будь ласка, надішли дійсне посилання.")
         return
 
-    # Зберігаємо посилання для використання після натискання кнопки
     context.user_data['url'] = url
-
-    # Створюємо кнопки вибору формату
     keyboard = [
         [
             InlineKeyboardButton("🎵 Завантажити Аудіо", callback_data="audio"),
             InlineKeyboardButton("🎬 Завантажити Відео", callback_data="video")
         ]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text("Обери формат завантаження:", reply_markup=reply_markup)
+    await update.message.reply_text("Обери формат:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def process_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -37,99 +30,77 @@ async def process_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     url = context.user_data.get('url')
     if not url:
-        await query.edit_message_text("❌ Посилання втрачено. Будь ласка, надішли його знову.")
+        await query.edit_message_text("❌ Посилання втрачено. Надішли його знову.")
         return
 
     format_choice = query.data
-    status_msg = await query.edit_message_text("⏳ Завантажую... Якщо це плейлист, файли надсилатимуться по черзі.")
+    status_msg = await query.edit_message_text("⏳ Обробка через онлайн-шлюз... Зачекайте хвилинку.")
 
-    # Базові налаштування з ОБХОДОМ БЛОКУВАННЯ (зміна клієнта та заголовків)
-    ydl_opts = {
-        'outtmpl': 'downloads/%(title)s.%(ext)s',
-        'noplaylist': False,  # Дозволяємо плейлисти
-        'ignoreerrors': False, # Пропускати видалені або приватні відео в плейлистах
-        'no_warnings': True,
-        'max_filesize': 50 * 1024 * 1024, # Обмеження Telegram у 50 МБ
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['mweb', 'android_embedded', 'ios'],
-                'skip': ['hls', 'dash']
-            }
-        },
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
-            'Accept-Language': 'en-US,en;q=0.9',
+    def fetch_media():
+        api_url = "https://api.cobalt.tools/"
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
         }
-    }
-
-    # Налаштовуємо формат залежно від вибору користувача
-    if format_choice == 'audio':
-        ydl_opts['format'] = 'bestaudio/best'
-        ydl_opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }]
-    else:
-        ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+        payload = {
+            "url": url,
+            "downloadMode": "audio" if format_choice == "audio" else "auto",
+            "audioFormat": "mp3"
+        }
+        response = requests.post(api_url, json=payload, headers=headers, timeout=30)
+        return response.json()
 
     try:
-        loop = asyncio.get_running_loop()
-        def extract():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=True)
-                
-        info = await loop.run_in_executor(None, extract)
-        
-        if not info:
-            await status_msg.edit_text("❌ Не вдалося отримати дані. Можливо, контент заблоковано.")
-            return
+        data = await asyncio.to_thread(fetch_media)
+        status = data.get("status")
 
-        # Обробляємо як одне відео, так і масив плейлиста
-        entries = []
-        if 'entries' in info and info['entries'] is not None:
-            entries = [e for e in info['entries'] if e is not None]
-        else:
-            entries = [info]
-
-        if not entries:
-            await status_msg.edit_text("❌ Не знайдено доступних файлів для завантаження.")
-            return
-
-        # Шукаємо та відправляємо всі завантажені файли
-        files_sent = 0
-        for entry in entries:
-            title = entry.get('title', 'Media')
+        if status in ["tunnel", "redirect"]:
+            file_url = data.get("url")
+            filename = "audio.mp3" if format_choice == "audio" else "video.mp4"
             
-            # Скануємо папку downloads, знаходимо завантажений файл і відправляємо
-            for filename in os.listdir('downloads'):
-                file_path = os.path.join('downloads', filename)
-                if os.path.isfile(file_path):
-                    with open(file_path, 'rb') as file_data:
-                        if format_choice == 'audio':
-                            await context.bot.send_audio(chat_id=query.message.chat_id, audio=file_data, title=title)
-                        else:
-                            await context.bot.send_video(chat_id=query.message.chat_id, video=file_data, caption=title)
-                    os.remove(file_path) # Очищаємо після відправки
-                    files_sent += 1
+            await status_msg.edit_text("⏳ Завантажую та відправляю файл у Telegram...")
 
-        if files_sent > 0:
+            file_req = await asyncio.to_thread(requests.get, file_url)
+            file_bytes = file_req.content
+
+            if len(file_bytes) > 50 * 1024 * 1024:
+                await status_msg.edit_text("❌ Файл перевищує 50 МБ (обмеження Telegram).")
+                return
+
+            if format_choice == "audio":
+                await context.bot.send_audio(chat_id=query.message.chat_id, audio=file_bytes, filename=filename)
+            else:
+                await context.bot.send_video(chat_id=query.message.chat_id, video=file_bytes, filename=filename)
+            
             await status_msg.delete()
+
+        elif status == "picker":
+            items = data.get("picker", [])
+            await status_msg.edit_text(f"⏳ Знайдено плейлист ({len(items)} елементів). Надсилаю по черзі...")
+            
+            for item in items[:15]:  # Обмеження перші 15 треків
+                item_url = item.get("url")
+                if item_url:
+                    f_req = await asyncio.to_thread(requests.get, item_url)
+                    f_bytes = f_req.content
+                    if len(f_bytes) <= 50 * 1024 * 1024:
+                        if format_choice == "audio":
+                            await context.bot.send_audio(chat_id=query.message.chat_id, audio=f_bytes)
+                        else:
+                            await context.bot.send_video(chat_id=query.message.chat_id, video=f_bytes)
+            await status_msg.delete()
+
         else:
-            await status_msg.edit_text("❌ Файл перевищує ліміт Telegram (50 МБ) або сталася помилка конвертації.")
+            err_text = data.get("text", "Не вдалося отримати пряме посилання.")
+            await status_msg.edit_text(f"❌ Помилка сервісу: {err_text}")
 
     except Exception as e:
         await status_msg.edit_text(f"❌ Помилка: {str(e)[:150]}")
 
 if __name__ == '__main__':
-    if not os.path.exists('downloads'):
-        os.makedirs('downloads')
     app = Application.builder().token(TOKEN).build()
-    
-    # Додано обробники для повідомлень та кнопок
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_url))
     app.add_handler(CallbackQueryHandler(process_download))
-    
     app.run_polling()
     
