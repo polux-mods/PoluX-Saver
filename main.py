@@ -34,36 +34,57 @@ async def process_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     format_choice = query.data
-    status_msg = await query.edit_message_text("⏳ Обробка запиту через онлайн-шлюз... Зачекайте хвилинку.")
+    status_msg = await query.edit_message_text("⏳ Шукаю вільний сервер... Зачекайте хвилинку.")
 
     def fetch_media():
-        api_url = "https://api.cobalt.tools/"
-        # Додано заголовки браузера, щоб сервіс не блокував запит
+        # Список публічних серверів Cobalt, які НЕ вимагають авторизації (без JWT)
+        instances = [
+            "https://co.eepy.today/",
+            "https://cobalt.owo.vc/",
+            "https://api.cobalt.qwyku.com/",
+            "https://cobalt.kwiatektv.me/"
+        ]
+        
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Origin": "https://cobalt.tools",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
-        # Оновлений формат запиту під Cobalt API v10
+        
         payload = {
             "url": url,
             "isAudioOnly": True if format_choice == "audio" else False,
             "audioFormat": "mp3"
         }
-        response = requests.post(api_url, json=payload, headers=headers, timeout=30)
-        return response.json()
+        
+        # Бот по черзі стукає в сервери. Знаходить перший робочий — бере дані.
+        for api_url in instances:
+            try:
+                response = requests.post(api_url, json=payload, headers=headers, timeout=15)
+                if response.status_code == 200:
+                    return response.json()
+            except Exception:
+                continue # Якщо сервер недоступний, пробуємо наступний
+                
+        return {"error": {"code": "Усі безкоштовні сервери наразі перевантажені. Спробуйте через хвилину."}}
 
     try:
         data = await asyncio.to_thread(fetch_media)
+        
+        # Перевірка на внутрішні помилки сервера
+        if "error" in data:
+            err_text = data.get("error", {}).get("code", "Невідома помилка")
+            await status_msg.edit_text(f"❌ Помилка сервісу: {err_text}")
+            return
+
         status = data.get("status")
 
-        # Успішне отримання посилання
+        # Успішне отримання прямого посилання на файл
         if status in ["tunnel", "redirect"]:
             file_url = data.get("url")
             filename = "audio.mp3" if format_choice == "audio" else "video.mp4"
             
-            await status_msg.edit_text("⏳ Завантажую та відправляю файл у Telegram...")
+            await status_msg.edit_text("⏳ Файл знайдено! Завантажую та відправляю у Telegram...")
 
             file_req = await asyncio.to_thread(requests.get, file_url)
             file_bytes = file_req.content
@@ -82,9 +103,9 @@ async def process_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Обробка плейлистів
         elif status == "picker":
             items = data.get("picker", [])
-            await status_msg.edit_text(f"⏳ Знайдено плейлист ({len(items)} елементів). Надсилаю по черзі...")
+            await status_msg.edit_text(f"⏳ Знайдено плейлист ({len(items)} елементів). Надсилаю перші 15 треків...")
             
-            for item in items[:15]:  # Обмеження на перші 15 треків, щоб бот не завис
+            for item in items[:15]:
                 item_url = item.get("url")
                 if item_url:
                     f_req = await asyncio.to_thread(requests.get, item_url)
@@ -97,13 +118,10 @@ async def process_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.delete()
 
         else:
-            # Обробка помилок нового формату
-            error_info = data.get("error", {})
-            err_text = error_info.get("code", "Контент недоступний або заблокований")
-            await status_msg.edit_text(f"❌ Помилка сервісу: {err_text}")
+            await status_msg.edit_text("❌ Не вдалося обробити посилання. Можливо, воно не підтримується.")
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ Сталася системна помилка: {str(e)[:150]}")
+        await status_msg.edit_text(f"❌ Сталася помилка: {str(e)[:150]}")
 
 if __name__ == '__main__':
     app = Application.builder().token(TOKEN).build()
@@ -111,4 +129,4 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_url))
     app.add_handler(CallbackQueryHandler(process_download))
     app.run_polling()
-    
+        
