@@ -34,17 +34,21 @@ async def process_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     format_choice = query.data
-    status_msg = await query.edit_message_text("⏳ Обробка через онлайн-шлюз... Зачекайте хвилинку.")
+    status_msg = await query.edit_message_text("⏳ Обробка запиту через онлайн-шлюз... Зачекайте хвилинку.")
 
     def fetch_media():
         api_url = "https://api.cobalt.tools/"
+        # Додано заголовки браузера, щоб сервіс не блокував запит
         headers = {
             "Accept": "application/json",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Origin": "https://cobalt.tools",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
+        # Оновлений формат запиту під Cobalt API v10
         payload = {
             "url": url,
-            "downloadMode": "audio" if format_choice == "audio" else "auto",
+            "isAudioOnly": True if format_choice == "audio" else False,
             "audioFormat": "mp3"
         }
         response = requests.post(api_url, json=payload, headers=headers, timeout=30)
@@ -54,6 +58,7 @@ async def process_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = await asyncio.to_thread(fetch_media)
         status = data.get("status")
 
+        # Успішне отримання посилання
         if status in ["tunnel", "redirect"]:
             file_url = data.get("url")
             filename = "audio.mp3" if format_choice == "audio" else "video.mp4"
@@ -74,11 +79,12 @@ async def process_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await status_msg.delete()
 
+        # Обробка плейлистів
         elif status == "picker":
             items = data.get("picker", [])
             await status_msg.edit_text(f"⏳ Знайдено плейлист ({len(items)} елементів). Надсилаю по черзі...")
             
-            for item in items[:15]:  # Обмеження перші 15 треків
+            for item in items[:15]:  # Обмеження на перші 15 треків, щоб бот не завис
                 item_url = item.get("url")
                 if item_url:
                     f_req = await asyncio.to_thread(requests.get, item_url)
@@ -91,11 +97,13 @@ async def process_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.delete()
 
         else:
-            err_text = data.get("text", "Не вдалося отримати пряме посилання.")
+            # Обробка помилок нового формату
+            error_info = data.get("error", {})
+            err_text = error_info.get("code", "Контент недоступний або заблокований")
             await status_msg.edit_text(f"❌ Помилка сервісу: {err_text}")
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ Помилка: {str(e)[:150]}")
+        await status_msg.edit_text(f"❌ Сталася системна помилка: {str(e)[:150]}")
 
 if __name__ == '__main__':
     app = Application.builder().token(TOKEN).build()
