@@ -4,6 +4,8 @@ import os
 import re
 import shutil
 import tempfile
+import subprocess
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
@@ -34,7 +36,10 @@ PORT = int(os.getenv("PORT", "10000"))
 # Local Node.js + BgUtils PO-token provider paths prepared by build.sh
 BASE_DIR = Path(__file__).resolve().parent
 LOCAL_NODE_BIN = BASE_DIR / ".node" / "bin"
-BGUTIL_SCRIPT = BASE_DIR / "bgutil-ytdlp-pot-provider" / "server" / "build" / "generate_once.js"
+BGUTIL_DIR = BASE_DIR / "bgutil-ytdlp-pot-provider" / "server"
+BGUTIL_MAIN = BGUTIL_DIR / "build" / "main.js"
+BGUTIL_PORT = int(os.getenv("BGUTIL_PORT", "4416"))
+BGUTIL_PROCESS = None
 if LOCAL_NODE_BIN.is_dir():
     os.environ["PATH"] = str(LOCAL_NODE_BIN) + os.pathsep + os.environ.get("PATH", "")
 
@@ -47,11 +52,12 @@ YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 
 
 def youtube_options_base():
-    """Common yt-dlp options for YouTube on a headless Render server.
+    """Common yt-dlp options for YouTube on Render.
 
-    yt-dlp increasingly encounters YouTube anti-bot / PO-token checks. We first
-    try clients that can work without an account, and optionally use a cookie
-    file supplied through the YOUTUBE_COOKIES environment variable.
+    The BgUtils provider is run as a local HTTP server on 127.0.0.1:4416.
+    yt-dlp's bgutil plugin then obtains a fresh PO token for the requested
+    video. This is the recommended setup from the current yt-dlp PO-token
+    guide.
     """
     options = {
         "retries": 3,
@@ -67,15 +73,20 @@ def youtube_options_base():
         },
         "extractor_args": {
             "youtube": {
-                # mweb is the client recommended by yt-dlp when a PO-token
-                # provider is installed. The provider plugin supplies tokens
-                # automatically per video.
-                "player_client": ["mweb", "android_vr", "web_safari", "tv"],
+                "player_client": ["mweb", "web_safari", "android_vr"],
                 "player_skip": ["webpage", "configs"],
             },
+            "youtubepot-bgutilhttp": {
+                "base_url": f"http://127.0.0.1:{BGUTIL_PORT}",
+            },
         },
-        # yt-dlp will auto-discover bgutil-ytdlp-pot-provider when installed.
-        # Enable the external provider if a Render service URL is supplied.
+        # yt-dlp 2026.x expects {runtime: {config}}, not {runtime: path}.
+        # The path is therefore supplied under the runtime's "path" config.
+        "js_runtimes": {
+            "node": {
+                "path": str(LOCAL_NODE_BIN / "node"),
+            }
+        },
     }
 
     if YOUTUBE_COOKIES:
@@ -85,17 +96,63 @@ def youtube_options_base():
         else:
             logger.warning("YOUTUBE_COOKIES is set but file does not exist: %s", cookie_path)
 
-    # Use the local BgUtils script provider built during Render deployment.
-    # This generates PO tokens automatically for the video being requested.
-    if BGUTIL_SCRIPT.is_file():
-        options["extractor_args"]["youtubepot-bgutilscript"] = {
-            "script_path": str(BGUTIL_SCRIPT)
-        }
-        options["js_runtimes"] = {"node": {"path": str(LOCAL_NODE_BIN / "node")}}
-    else:
-        logger.warning("BgUtils provider script not found: %s", BGUTIL_SCRIPT)
-
     return options
+
+
+def start_bgutil_provider():
+    """Start BgUtils HTTP provider if its compiled server exists."""
+    global BGUTIL_PROCESS
+
+    if not BGUTIL_MAIN.is_file():
+        logger.error("BgUtils server not found: %s", BGUTIL_MAIN)
+        return False
+
+    node = LOCAL_NODE_BIN / "node"
+    if not node.is_file():
+        logger.error("Local Node.js not found: %s", node)
+        return False
+
+    logger.info("Starting BgUtils PO-token provider on 127.0.0.1:%s", BGUTIL_PORT)
+
+    BGUTIL_PROCESS = subprocess.Popen(
+        [str(node), str(BGUTIL_MAIN), "--port", str(BGUTIL_PORT)],
+        cwd=str(BGUTIL_DIR),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+        env=os.environ.copy(),
+    )
+
+    # Give the server a moment to bind its port.
+    import urllib.request
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if BGUTIL_PROCESS.poll() is not None:
+            logger.error("BgUtils process exited with code %s", BGUTIL_PROCESS.returncode)
+            return False
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{BGUTIL_PORT}/ping", timeout=1
+            ) as response:
+                if response.status == 200:
+                    logger.info("BgUtils PO-token provider is ready")
+                    return True
+        except Exception:
+            time.sleep(0.25)
+
+    logger.error("BgUtils provider did not become ready within 15 seconds")
+    return False
+
+
+def stop_bgutil_provider():
+    global BGUTIL_PROCESS
+    if BGUTIL_PROCESS is not None and BGUTIL_PROCESS.poll() is None:
+        logger.info("Stopping BgUtils PO-token provider...")
+        BGUTIL_PROCESS.terminate()
+        try:
+            BGUTIL_PROCESS.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            BGUTIL_PROCESS.kill()
+    BGUTIL_PROCESS = None
 
 
 def human_youtube_error(error: Exception) -> str:
@@ -963,13 +1020,11 @@ async def health():
 
 @app.get("/debug/youtube")
 async def debug_youtube():
-    node_path = LOCAL_NODE_BIN / "node"
     return {
-        "yt_dlp_version": __import__("yt_dlp").version.__version__,
-        "node_exists": node_path.is_file(),
-        "node_path": str(node_path),
-        "bgutil_script_exists": BGUTIL_SCRIPT.is_file(),
-        "bgutil_script": str(BGUTIL_SCRIPT),
+        "node_exists": (LOCAL_NODE_BIN / "node").is_file(),
+        "bgutil_main_exists": BGUTIL_MAIN.is_file(),
+        "bgutil_running": BGUTIL_PROCESS is not None and BGUTIL_PROCESS.poll() is None,
+        "bgutil_port": BGUTIL_PORT,
         "cookies_configured": bool(YOUTUBE_COOKIES),
     }
 
@@ -1055,6 +1110,9 @@ async def telegram_webhook(
 @app.on_event("startup")
 async def startup():
 
+    if not start_bgutil_provider():
+        logger.warning("BgUtils PO-token provider is unavailable; YouTube may reject requests.")
+
     logger.info(
         "Starting Telegram application..."
     )
@@ -1115,6 +1173,7 @@ async def shutdown():
         await telegram_app.stop()
     finally:
         await telegram_app.shutdown()
+        stop_bgutil_provider()
 
     logger.info("Telegram application stopped.")
 

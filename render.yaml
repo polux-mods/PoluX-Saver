@@ -9,7 +9,5 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: PUBLIC_URL
-        sync: false
       - key: WEBHOOK_SECRET
         generateValue: true
