@@ -34,6 +34,64 @@ PORT = int(os.getenv("PORT", "10000"))
 MAX_FILE_SIZE = 49 * 1024 * 1024
 MAX_PLAYLIST_ITEMS = 15
 
+# Optional YouTube cookies. Keep this EMPTY unless you intentionally configure
+# a cookies file on Render. Never put cookies.txt into GitHub.
+YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
+
+
+def youtube_options_base():
+    """Common yt-dlp options for YouTube on a headless Render server.
+
+    yt-dlp increasingly encounters YouTube anti-bot / PO-token checks. We first
+    try clients that can work without an account, and optionally use a cookie
+    file supplied through the YOUTUBE_COOKIES environment variable.
+    """
+    options = {
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 30,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        "extractor_args": {
+            "youtube": {
+                # Prefer clients that currently have fewer PO-token
+                # requirements on a headless server. yt-dlp may still fall
+                # back internally when one client has no usable formats.
+                "player_client": ["android_vr", "web_safari", "tv"],
+            }
+        },
+    }
+
+    if YOUTUBE_COOKIES:
+        cookie_path = Path(YOUTUBE_COOKIES)
+        if cookie_path.is_file():
+            options["cookiefile"] = str(cookie_path)
+        else:
+            logger.warning("YOUTUBE_COOKIES is set but file does not exist: %s", cookie_path)
+
+    return options
+
+
+def human_youtube_error(error: Exception) -> str:
+    """Turn common yt-dlp errors into a useful Telegram message."""
+    text = str(error)
+    if "Sign in to confirm you’re not a bot" in text or "Sign in to confirm you're not a bot" in text:
+        return (
+            "YouTube заблокував запит із сервера (anti-bot).\n\n"
+            "Це не помилка Telegram або Render. Спробуй інше відео. "
+            "Якщо блокування повторюється для всіх відео, потрібно буде "
+            "підключити YouTube cookies або PO Token."
+        )
+    if "Requested format is not available" in text:
+        return "Для цього відео YouTube не надав потрібний формат."
+    return text[:1000]
+
 
 # =========================================================
 # LOGGING
@@ -91,12 +149,13 @@ def is_youtube_music_url(url: str) -> bool:
 
 def extract_info(url: str):
 
-    options = {
+    options = youtube_options_base()
+    options.update({
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "extract_flat": "in_playlist",
-    }
+    })
 
     with YoutubeDL(options) as ydl:
         return ydl.extract_info(
@@ -115,17 +174,13 @@ def download_audio(url: str, workdir: str):
         Path(workdir) / "%(title).80s.%(ext)s"
     )
 
-    options = {
+    options = youtube_options_base()
+    options.update({
         "format": "bestaudio/best",
-
         "outtmpl": output,
-
         "noplaylist": True,
-
         "quiet": True,
-
         "no_warnings": True,
-
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -135,7 +190,7 @@ def download_audio(url: str, workdir: str):
                 "preferredquality": "128",
             }
         ],
-    }
+    })
 
     with YoutubeDL(options) as ydl:
 
@@ -177,7 +232,8 @@ def download_video(url: str, workdir: str):
         Path(workdir) / "%(title).80s.%(ext)s"
     )
 
-    options = {
+    options = youtube_options_base()
+    options.update({
 
         "format": (
             "best[ext=mp4][height<=720]/"
@@ -194,9 +250,8 @@ def download_video(url: str, workdir: str):
         "noplaylist": True,
 
         "quiet": True,
-
         "no_warnings": True,
-    }
+    })
 
     with YoutubeDL(options) as ydl:
 
@@ -745,7 +800,7 @@ async def process_download(
                         text=(
                             f"⚠️ Елемент {index} "
                             f"не завантажено:\n"
-                            f"{str(error)[:500]}"
+                            f"{human_youtube_error(error)}"
                         ),
                     )
 
@@ -794,7 +849,7 @@ async def process_download(
         await status.edit_text(
 
             "❌ Помилка під час завантаження:\n\n"
-            f"{str(error)[:1000]}"
+            f"{human_youtube_error(error)}"
         )
 
 
