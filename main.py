@@ -4,11 +4,11 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import yt_dlp
 
-# ⚠️ ВСТАВТЕ СВІЙ ТОКЕН ВІД BOTFATHER МІЖ КУПЮРАМИ ⚠️
+# ⚠️ ВСТАВТЕ СВІЙ ТОКЕН ВІД BOTFATHER ⚠️
 TOKEN = "8787993439:AAFeVmWBRiVvMAlpO4SCnd3mT1Hlohkajxk"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привіт! Надішли мені посилання на YouTube-відео або плейлист, і я скачаю аудіо для тебе!")
+    await update.message.reply_text("Привіт! Надішли мені посилання на YouTube-відео або плейлист, і я скачаю аудіо!")
 
 async def download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
@@ -17,22 +17,20 @@ async def download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Будь ласка, надішли дійсне посилання.")
         return
 
-    status_msg = await update.message.reply_text("⏳ Завантажую аудіо... Це може зайняти від 10 секунд до пару хвилин.")
+    status_msg = await update.message.reply_text("⏳ Завантажую аудіо... Це може зайняти трохи часу.")
 
-    # Оновлені налаштування для обходу захисту YouTube від ботів
+    # Налаштування завантажувача з обходом блокувань
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': 'downloads/%(title)s.%(ext)s',
         'noplaylist': False,
-        # Емуляція мобільного додатка для обходу перевірки "Sign in"
+        'ignoreerrors': True,
+        'no_warnings': True,
         'extractor_args': {
             'youtube': {
                 'player_client': ['ios', 'android', 'web']
             }
         },
-        # Обмеження формату та ігнорування помилок окремих файлів
-        'ignoreerrors': True,
-        'no_warnings': True,
     }
 
     try:
@@ -43,15 +41,33 @@ async def download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
         info = await loop.run_in_executor(None, extract)
         
-        # Обробка: як для одного треку, так і для плейлистів
-        entries = info.get('entries', [info]) if 'entries' in info else [info]
-        
+        # Перевірка на порожню відповідь від yt-dlp
+        if not info:
+            await status_msg.edit_text("❌ Не вдалося отримати інформацію про відео. Перевірте посилання.")
+            return
+
+        # Захищена перевірка: це плейлист чи окреме відео
+        entries = []
+        if isinstance(info, dict):
+            if 'entries' in info and info['entries'] is not None:
+                entries = [e for e in info['entries'] if e is not None]
+            else:
+                entries = [info]
+
+        if not entries:
+            await status_msg.edit_text("❌ Не знайдено доступних треків для завантаження.")
+            return
+
+        # Відправка файлів у Telegram
         for entry in entries:
-            filename = ydl.prepare_filename(entry)
-            if os.path.exists(filename):
-                with open(filename, 'rb') as audio:
-                    await update.message.reply_audio(audio=audio, title=entry.get('title', 'Audio'))
-                os.remove(filename)
+            title = entry.get('title', 'Audio')
+            # Шукаємо завантажений файл у папці downloads
+            for file in os.listdir('downloads'):
+                file_path = os.path.join('downloads', file)
+                if os.path.isfile(file_path):
+                    with open(file_path, 'rb') as audio:
+                        await update.message.reply_audio(audio=audio, title=title)
+                    os.remove(file_path) # Видаляємо після відправки
 
         await status_msg.delete()
 
