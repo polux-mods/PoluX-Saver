@@ -19,11 +19,20 @@ async def download_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("⏳ Завантажую аудіо... Це може зайняти від 10 секунд до пару хвилин.")
 
-    # Налаштування завантажувача
+    # Оновлені налаштування для обходу захисту YouTube від ботів
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': 'downloads/%(title)s.%(ext)s',
         'noplaylist': False,
+        # Емуляція мобільного додатка для обходу перевірки "Sign in"
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'android', 'web']
+            }
+        },
+        # Обмеження формату та ігнорування помилок окремих файлів
+        'ignoreerrors': True,
+        'no_warnings': True,
     }
 
     try:
