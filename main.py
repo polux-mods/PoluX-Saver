@@ -47,7 +47,7 @@ async def process_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ydl_opts = {
         'outtmpl': 'downloads/%(title)s.%(ext)s',
         'noplaylist': False,  # Дозволяємо плейлисти
-        'ignoreerrors': True, # Пропускати видалені або приватні відео в плейлистах
+        'ignoreerrors': False, # Пропускати видалені або приватні відео в плейлистах
         'no_warnings': True,
         'max_filesize': 50 * 1024 * 1024, # Обмеження Telegram у 50 МБ
         'extractor_args': {
