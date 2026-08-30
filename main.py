@@ -91,7 +91,7 @@ def youtube_options_base():
         options["extractor_args"]["youtubepot-bgutilscript"] = {
             "script_path": str(BGUTIL_SCRIPT)
         }
-        options["js_runtimes"] = {"node": str(LOCAL_NODE_BIN / "node")}
+        options["js_runtimes"] = {"node": {"path": str(LOCAL_NODE_BIN / "node")}}
     else:
         logger.warning("BgUtils provider script not found: %s", BGUTIL_SCRIPT)
 
@@ -958,6 +958,19 @@ async def health():
 
     return {
         "status": "ok"
+    }
+
+
+@app.get("/debug/youtube")
+async def debug_youtube():
+    node_path = LOCAL_NODE_BIN / "node"
+    return {
+        "yt_dlp_version": __import__("yt_dlp").version.__version__,
+        "node_exists": node_path.is_file(),
+        "node_path": str(node_path),
+        "bgutil_script_exists": BGUTIL_SCRIPT.is_file(),
+        "bgutil_script": str(BGUTIL_SCRIPT),
+        "cookies_configured": bool(YOUTUBE_COOKIES),
     }
 
 
