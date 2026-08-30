@@ -71,22 +71,22 @@ def youtube_options_base():
             ),
             "Accept-Language": "en-US,en;q=0.9",
         },
+        "force_ipv4": True,
         "extractor_args": {
+            # Current yt-dlp guidance recommends mweb + a PO-token provider.
+            # Do not skip the webpage/config requests here: on current YouTube
+            # those requests are needed by some mweb flows.
             "youtube": {
-                "player_client": ["mweb", "web_safari", "android_vr"],
-                "player_skip": ["webpage", "configs"],
+                "player_client": ["mweb"],
             },
             "youtubepot-bgutilhttp": {
                 "base_url": f"http://127.0.0.1:{BGUTIL_PORT}",
             },
         },
-        # yt-dlp 2026.x expects {runtime: {config}}, not {runtime: path}.
-        # The path is therefore supplied under the runtime's "path" config.
-        "js_runtimes": {
-            "node": {
-                "path": str(LOCAL_NODE_BIN / "node"),
-            }
-        },
+        # Node is placed first in PATH by the startup code, so yt-dlp can
+        # discover it automatically for JS challenges. We intentionally do
+        # not pass js_runtimes here; malformed js_runtimes dictionaries were
+        # the cause of the previous "Invalid js_runtimes format" error.
     }
 
     if YOUTUBE_COOKIES:
@@ -114,12 +114,20 @@ def start_bgutil_provider():
 
     logger.info("Starting BgUtils PO-token provider on 127.0.0.1:%s", BGUTIL_PORT)
 
+    provider_env = os.environ.copy()
+    # Prefer IPv4 inside Render; some Render environments can have IPv6
+    # connectivity issues when the provider contacts YouTube.
+    provider_env["NODE_OPTIONS"] = (
+        provider_env.get("NODE_OPTIONS", "")
+        + " --dns-result-order=ipv4first"
+    ).strip()
+
     BGUTIL_PROCESS = subprocess.Popen(
         [str(node), str(BGUTIL_MAIN), "--port", str(BGUTIL_PORT)],
         cwd=str(BGUTIL_DIR),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
-        env=os.environ.copy(),
+        env=provider_env,
     )
 
     # Give the server a moment to bind its port.
@@ -1022,10 +1030,19 @@ async def health():
 async def debug_youtube():
     return {
         "node_exists": (LOCAL_NODE_BIN / "node").is_file(),
+        "node_path": str(LOCAL_NODE_BIN / "node"),
+        "node_version": (
+            os.popen(f'"{LOCAL_NODE_BIN / "node"}" --version').read().strip()
+            if (LOCAL_NODE_BIN / "node").is_file()
+            else None
+        ),
         "bgutil_main_exists": BGUTIL_MAIN.is_file(),
         "bgutil_running": BGUTIL_PROCESS is not None and BGUTIL_PROCESS.poll() is None,
         "bgutil_port": BGUTIL_PORT,
+        "bgutil_url": f"http://127.0.0.1:{BGUTIL_PORT}",
         "cookies_configured": bool(YOUTUBE_COOKIES),
+        "player_client": "mweb",
+        "force_ipv4": True,
     }
 
 
