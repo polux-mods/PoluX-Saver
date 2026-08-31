@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, FileResponse
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -51,6 +51,9 @@ MAX_FILE_SIZE = 49 * 1024 * 1024
 MAX_PLAYLIST_ITEMS = 15
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 DB_FILE = BASE_DIR / "bot_database.db"
+
+DOWNLOADS_DIR = BASE_DIR / "downloads"
+DOWNLOADS_DIR.mkdir(exist_ok=True)
 
 
 # =========================================================
@@ -310,11 +313,42 @@ def is_youtube_music_url(url: str) -> bool:
     return bool(re.match(r"^https?://music\.youtube\.com/", url, re.IGNORECASE))
 
 
-def extract_info(url: str):
+def get_video_formats_info(url: str):
+    """Отримує список доступних роздільностей та приблизний розмір у МБ."""
     options = youtube_options_base()
-    options.update({"quiet": True, "no_warnings": True, "skip_download": True, "extract_flat": "in_playlist"})
+    options.update({"quiet": True, "no_warnings": True, "skip_download": True})
+    
     with YoutubeDL(options) as ydl:
-        return ydl.extract_info(url, download=False)
+        info = ydl.extract_info(url, download=False)
+        
+    formats = info.get("formats", [])
+    
+    audio_bytes = 0
+    for f in formats:
+        if f.get("vcodec") == "none" and f.get("acodec") != "none":
+            sz = f.get("filesize") or f.get("filesize_approx") or 0
+            if sz > audio_bytes:
+                audio_bytes = sz
+
+    height_tiers = [1080, 720, 480, 360]
+    available_qualities = []
+
+    for h in height_tiers:
+        video_bytes = 0
+        found = False
+        for f in formats:
+            if f.get("vcodec") != "none" and f.get("height") == h:
+                found = True
+                sz = f.get("filesize") or f.get("filesize_approx") or 0
+                if sz > video_bytes:
+                    video_bytes = sz
+
+        if found:
+            total_bytes = video_bytes + audio_bytes
+            mb = round(total_bytes / (1024 * 1024), 1) if total_bytes > 0 else 0
+            available_qualities.append({"height": h, "size_mb": mb})
+
+    return available_qualities, info.get("title", "video")
 
 
 def download_audio(url: str, workdir: str):
@@ -340,47 +374,32 @@ def download_audio(url: str, workdir: str):
         raise FileNotFoundError("MP3 not found")
 
 
-def download_video(url: str, workdir: str):
-    # Рівні якості: від бажаної (720p) до мінімальної (240p)
-    height_tiers = [720, 480, 360, 240]
+def download_video_quality(url: str, workdir: str, height: int):
+    """Завантажує відео обраної якості."""
+    output = str(Path(workdir) / "%(title).80s.%(ext)s")
+    options = youtube_options_base()
+    options.update({
+        "format": f"bestvideo[ext=mp4][height<={height}]+bestaudio[ext=m4a]/best[ext=mp4][height<={height}]/best[height<={height}]",
+        "outtmpl": output,
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    })
     
-    for height in height_tiers:
-        # Видаляємо невдалі спроби з тимчасової папки перед наступною спробою
-        for item in Path(workdir).glob("*"):
-            if item.is_file():
-                item.unlink()
-
-        output = str(Path(workdir) / "%(title).80s.%(ext)s")
-        options = youtube_options_base()
-        options.update({
-            "format": f"bestvideo[ext=mp4][height<={height}]+bestaudio[ext=m4a]/best[ext=mp4][height<={height}]/best[height<={height}]",
-            "outtmpl": output,
-            "merge_output_format": "mp4",
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-        })
-
-        try:
-            with YoutubeDL(options) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-                mp4_file = str(Path(filename).with_suffix(".mp4"))
-
-                # Якщо розширення відрізняється, шукаємо згенерований файл
-                if not os.path.exists(mp4_file):
-                    video_files = [p for p in Path(workdir).iterdir() if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm"}]
-                    if video_files:
-                        mp4_file = str(video_files[0])
-
-                # Якщо файл завантажився і не перевищує 49 МБ — повертаємо його
-                if os.path.exists(mp4_file) and os.path.getsize(mp4_file) <= MAX_FILE_SIZE:
-                    return mp4_file, info
-
-        except Exception as e:
-            logger.warning("Спроба завантажити %sp не вдалася: %s", height, e)
-
-    raise ValueError("Нажаль, навіть у найнижчій якості (240p) це відео перевищує ліміт Telegram у 50 МБ.")
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        mp4_file = str(Path(filename).with_suffix(".mp4"))
+        
+        if os.path.exists(mp4_file):
+            return mp4_file, info
+        
+        video_files = [p for p in Path(workdir).iterdir() if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm"}]
+        if video_files:
+            return str(video_files[0]), info
+            
+        raise FileNotFoundError("Відеофайл не знайдено.")
 
 
 # =========================================================
@@ -496,7 +515,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         keyboard = []
         for ch in channels:
-            # Для кожного каналу створюємо кнопку видалення
             keyboard.append([
                 InlineKeyboardButton(f"❌ Видалити {ch['title']}", callback_data=f"del_chan:{ch['id']}")
             ])
@@ -508,13 +526,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Обробка натискання кнопки видалення
     if data.startswith("del_chan:"):
         ch_id = data.split(":", 1)[1]
         delete_sponsored_channel(ch_id)
         await query.answer("✅ Канал успішно видалено!", show_alert=True)
         
-        # Оновлюємо список після видалення
         channels = get_sponsored_channels()
         if not channels:
             await query.edit_message_text("Спонсорських каналів більше немає.")
@@ -537,35 +553,108 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Посилання втрачено. Надішли його ще раз.")
         return
 
-    status = await query.edit_message_text("⏳ Завантажую...")
-    workdir = tempfile.mkdtemp(prefix="yt_tg_")
+    # Натиснуто категорію "Відео" -> Показуємо вибір якості
+    if data == "video":
+        status = await query.edit_message_text("🔎 Отримую список доступних якостей...")
+        try:
+            qualities, title = await asyncio.to_thread(get_video_formats_info, url)
+            if not qualities:
+                await status.edit_text("❌ Не вдалося отримати варіанти якості для цього відео.")
+                return
 
-    try:
-        if data == "audio":
+            keyboard = []
+            for q in qualities:
+                size_str = f"~{q['size_mb']} МБ" if q['size_mb'] > 0 else "Розмір невідомий"
+                btn_text = f"🎬 {q['height']}p ({size_str})"
+                keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"vdl:{q['height']}")])
+
+            await status.edit_text(
+                f"📹 **{title[:60]}**\n\nОберіть бажану якість:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+        except Exception as error:
+            logger.exception("Format fetch failed")
+            await status.edit_text(f"❌ Помилка: {human_youtube_error(error)}")
+        return
+
+    # Завантаження обраної якості відео (наприклад vdl:720)
+    if data.startswith("vdl:"):
+        height = int(data.split(":")[1])
+        status = await query.edit_message_text(f"⏳ Завантажую відео у якості {height}p...")
+        workdir = tempfile.mkdtemp(prefix="yt_tg_")
+
+        try:
+            filepath, info = await asyncio.to_thread(download_video_quality, url, workdir, height)
+            file_size = os.path.getsize(filepath)
+
+            if file_size <= MAX_FILE_SIZE:
+                with open(filepath, "rb") as f:
+                    await context.bot.send_video(
+                        chat_id=query.message.chat_id,
+                        video=f,
+                        supports_streaming=True,
+                        duration=int(info.get("duration", 0)) or None,
+                    )
+                await status.delete()
+            else:
+                safe_name = f"{int(time.time())}_{Path(filepath).name}"
+                web_path = DOWNLOADS_DIR / safe_name
+                shutil.move(filepath, web_path)
+
+                download_link = f"{PUBLIC_URL}/download/{safe_name}"
+                mb_size = round(file_size / (1024 * 1024), 1)
+
+                await status.edit_text(
+                    f"📦 **Файл перевищує 50 МБ** ({mb_size} МБ).\n"
+                    f"Telegram не дозволяє надсилати такі файли напряму.\n\n"
+                    f"🔗 [Натисніть сюди, щоб завантажити відео]({download_link})",
+                    parse_mode="Markdown"
+                )
+        except Exception as error:
+            logger.exception("Download failed")
+            await status.edit_text(f"❌ Помилка: {human_youtube_error(error)}")
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        return
+
+    # Завантаження аудіо
+    if data == "audio":
+        status = await query.edit_message_text("⏳ Завантажую аудіо...")
+        workdir = tempfile.mkdtemp(prefix="yt_tg_")
+        try:
             filepath, info = await asyncio.to_thread(download_audio, url, workdir)
-            with open(filepath, "rb") as f:
-                await context.bot.send_audio(
-                    chat_id=query.message.chat_id,
-                    audio=f,
-                    title=info.get("title", "audio")[:64],
-                    performer=info.get("artist") or info.get("uploader"),
-                    duration=int(info.get("duration", 0)) or None,
+            file_size = os.path.getsize(filepath)
+
+            if file_size <= MAX_FILE_SIZE:
+                with open(filepath, "rb") as f:
+                    await context.bot.send_audio(
+                        chat_id=query.message.chat_id,
+                        audio=f,
+                        title=info.get("title", "audio")[:64],
+                        performer=info.get("artist") or info.get("uploader"),
+                        duration=int(info.get("duration", 0)) or None,
+                    )
+                await status.delete()
+            else:
+                safe_name = f"{int(time.time())}_{Path(filepath).name}"
+                web_path = DOWNLOADS_DIR / safe_name
+                shutil.move(filepath, web_path)
+
+                download_link = f"{PUBLIC_URL}/download/{safe_name}"
+                mb_size = round(file_size / (1024 * 1024), 1)
+
+                await status.edit_text(
+                    f"📦 **Аудіо перевищує 50 МБ** ({mb_size} МБ).\n\n"
+                    f"🔗 [Натисніть сюди, щоб завантажити аудіо]({download_link})",
+                    parse_mode="Markdown"
                 )
-        else:
-            filepath, info = await asyncio.to_thread(download_video, url, workdir)
-            with open(filepath, "rb") as f:
-                await context.bot.send_video(
-                    chat_id=query.message.chat_id,
-                    video=f,
-                    supports_streaming=True,
-                    duration=int(info.get("duration", 0)) or None,
-                )
-        await status.delete()
-    except Exception as error:
-        logger.exception("Download failed")
-        await status.edit_text(f"❌ Помилка: {human_youtube_error(error)}")
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        except Exception as error:
+            logger.exception("Download failed")
+            await status.edit_text(f"❌ Помилка: {human_youtube_error(error)}")
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        return
 
 
 async def handle_admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -642,6 +731,13 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+@app.get("/download/{filename}")
+async def get_download_file(filename: str):
+    file_path = DOWNLOADS_DIR / filename
+    if file_path.is_file():
+        return FileResponse(file_path, media_type="application/octet-stream", filename=filename)
+    raise HTTPException(status_code=404, detail="Файл не знайдено або термін дії посилання вичерпано")
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
