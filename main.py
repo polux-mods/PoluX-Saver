@@ -4,8 +4,10 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
@@ -33,7 +35,6 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 PORT = int(os.getenv("PORT", "10000"))
 
-# Telegram ID первинного суперадміна (встанови свій ID у змінні оточення на Render)
 INITIAL_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -57,11 +58,9 @@ DB_FILE = BASE_DIR / "bot_database.db"
 # =========================================================
 
 def init_db():
-    """Створення таблиць бази даних при старті."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # Таблиця користувачів та мов
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -69,14 +68,12 @@ def init_db():
         )
     """)
     
-    # Таблиця адмінів
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS admins (
             user_id INTEGER PRIMARY KEY
         )
     """)
     
-    # Таблиця рекламних / спонсорських каналів
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS channels (
             channel_id TEXT PRIMARY KEY,
@@ -85,7 +82,6 @@ def init_db():
         )
     """)
     
-    # Додаємо первинного адміна з ENV
     if INITIAL_ADMIN_ID > 0:
         cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (INITIAL_ADMIN_ID,))
         
@@ -141,13 +137,6 @@ def add_sponsored_channel(channel_id: str, title: str, link: str):
     conn.commit()
     conn.close()
 
-def remove_sponsored_channel(channel_id: str):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
-    conn.commit()
-    conn.close()
-
 
 # =========================================================
 # LOCALIZATION (TEXTS)
@@ -192,7 +181,6 @@ TEXTS = {
 # =========================================================
 
 async def check_user_subscriptions(bot, user_id: int):
-    """Повертає список каналів, на які користувач ЩЕ НЕ підписався."""
     channels = get_sponsored_channels()
     unsubscribed = []
     
@@ -203,7 +191,6 @@ async def check_user_subscriptions(bot, user_id: int):
                 unsubscribed.append(ch)
         except Exception as e:
             logger.warning("Could not check membership for channel %s: %s", ch["id"], e)
-            # Якщо бот не адмін у каналі або ID невідомий — вважаємо, що потрібно підписатися
             unsubscribed.append(ch)
             
     return unsubscribed
@@ -405,7 +392,6 @@ async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     lang = get_user_lang(user_id)
 
-    # 1. ПЕРЕВІРКА СПОНСОРСЬКИХ ПІДПИСОК
     unsubscribed = await check_user_subscriptions(context.bot, user_id)
     if unsubscribed:
         keyboard = []
@@ -420,7 +406,6 @@ async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 2. ПЕРЕВІРКА YOUTUBE ПОСИЛАННЯ
     if not is_youtube_url(url):
         await update.message.reply_text(TEXTS[lang]["invalid_url"])
         return
@@ -447,14 +432,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_user_lang(user_id)
     data = query.data
 
-    # Зміна мови
     if data == "toggle_lang":
         new_lang = "en" if lang == "ua" else "ua"
         set_user_lang(user_id, new_lang)
         await query.edit_message_text(TEXTS[new_lang]["lang_set"])
         return
 
-    # Перевірка підписки за кнопкою
     if data == "check_subscription":
         unsubscribed = await check_user_subscriptions(context.bot, user_id)
         if not unsubscribed:
@@ -463,7 +446,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(TEXTS[lang]["sub_failed"], show_alert=True)
         return
 
-    # АДМІН ДІЇ
     if data == "admin_add_admin":
         context.user_data["admin_state"] = "await_admin_id"
         await query.edit_message_text("Надішліть Telegram ID користувача, якому хочете надати права адміна:")
@@ -490,7 +472,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msg, parse_mode="Markdown")
         return
 
-    # СКАЧУВАННЯ ВІДЕО / АУДІО
     url = context.user_data.get("url")
     if not url:
         await query.edit_message_text("❌ Посилання втрачено. Надішли його ще раз.")
@@ -528,7 +509,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробник тексту для введення ID адміна або даних каналу."""
     user_id = update.effective_user.id
     if not is_admin(user_id):
         return
@@ -559,7 +539,7 @@ async def handle_admin_text_input(update: Update, context: ContextTypes.DEFAULT_
 
 
 # =========================================================
-# APPLICATION SETUP
+# APPLICATION SETUP & LIFESPAN
 # =========================================================
 
 telegram_app = Application.builder().token(TOKEN).updater(None).build()
@@ -568,12 +548,32 @@ telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("settings", settings_command))
 telegram_app.add_handler(CommandHandler("admin", admin_command))
 
-# Текстові обробники
 telegram_app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\d+$|^@"), handle_admin_text_input))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_url))
 telegram_app.add_handler(CallbackQueryHandler(handle_callback))
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    start_bgutil_provider()
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.bot.set_webhook(
+        url=WEBHOOK_URL,
+        secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+    )
+    yield
+    try:
+        await telegram_app.stop()
+    finally:
+        await telegram_app.shutdown()
+        stop_bgutil_provider()
+
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
@@ -594,26 +594,6 @@ async def telegram_webhook(request: Request):
     await telegram_app.update_queue.put(update)
     return PlainTextResponse("OK")
 
-@app.on_event("startup")
-async def startup():
-    init_db()
-    start_bgutil_provider()
-    await telegram_app.initialize()
-    await telegram_app.start()
-    await telegram_app.bot.set_webhook(
-        url=WEBHOOK_URL,
-        secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=False,
-    )
-
-@app.on_event("shutdown")
-async def shutdown():
-    try:
-        await telegram_app.stop()
-    finally:
-        await telegram_app.shutdown()
-        stop_bgutil_provider()
 
 if __name__ == "__main__":
     import uvicorn
