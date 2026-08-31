@@ -566,4 +566,55 @@ telegram_app = Application.builder().token(TOKEN).updater(None).build()
 
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("settings", settings_command))
-telegram_a
+telegram_app.add_handler(CommandHandler("admin", admin_command))
+
+# Текстові обробники
+telegram_app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\d+$|^@"), handle_admin_text_input))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_url))
+telegram_app.add_handler(CallbackQueryHandler(handle_callback))
+
+app = FastAPI()
+
+@app.get("/")
+async def root():
+    return PlainTextResponse("YouTube Bot is running.")
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    if WEBHOOK_SECRET:
+        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if secret != WEBHOOK_SECRET:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.update_queue.put(update)
+    return PlainTextResponse("OK")
+
+@app.on_event("startup")
+async def startup():
+    init_db()
+    start_bgutil_provider()
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.bot.set_webhook(
+        url=WEBHOOK_URL,
+        secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+    )
+
+@app.on_event("shutdown")
+async def shutdown():
+    try:
+        await telegram_app.stop()
+    finally:
+        await telegram_app.shutdown()
+        stop_bgutil_provider()
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
