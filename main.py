@@ -341,26 +341,46 @@ def download_audio(url: str, workdir: str):
 
 
 def download_video(url: str, workdir: str):
-    output = str(Path(workdir) / "%(title).80s.%(ext)s")
-    options = youtube_options_base()
-    options.update({
-        "format": "best[ext=mp4][height<=720]/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best",
-        "outtmpl": output,
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-    })
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        mp4_file = str(Path(filename).with_suffix(".mp4"))
-        if os.path.exists(mp4_file):
-            return mp4_file, info
-        video_files = [p for p in Path(workdir).iterdir() if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm"}]
-        if video_files:
-            return str(video_files[0]), info
-        raise FileNotFoundError("Video not found")
+    # Рівні якості: від бажаної (720p) до мінімальної (240p)
+    height_tiers = [720, 480, 360, 240]
+    
+    for height in height_tiers:
+        # Видаляємо невдалі спроби з тимчасової папки перед наступною спробою
+        for item in Path(workdir).glob("*"):
+            if item.is_file():
+                item.unlink()
+
+        output = str(Path(workdir) / "%(title).80s.%(ext)s")
+        options = youtube_options_base()
+        options.update({
+            "format": f"bestvideo[ext=mp4][height<={height}]+bestaudio[ext=m4a]/best[ext=mp4][height<={height}]/best[height<={height}]",
+            "outtmpl": output,
+            "merge_output_format": "mp4",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+        })
+
+        try:
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                mp4_file = str(Path(filename).with_suffix(".mp4"))
+
+                # Якщо розширення відрізняється, шукаємо згенерований файл
+                if not os.path.exists(mp4_file):
+                    video_files = [p for p in Path(workdir).iterdir() if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm"}]
+                    if video_files:
+                        mp4_file = str(video_files[0])
+
+                # Якщо файл завантажився і не перевищує 49 МБ — повертаємо його
+                if os.path.exists(mp4_file) and os.path.getsize(mp4_file) <= MAX_FILE_SIZE:
+                    return mp4_file, info
+
+        except Exception as e:
+            logger.warning("Спроба завантажити %sp не вдалася: %s", height, e)
+
+    raise ValueError("Нажаль, навіть у найнижчій якості (240p) це відео перевищує ліміт Telegram у 50 МБ.")
 
 
 # =========================================================
