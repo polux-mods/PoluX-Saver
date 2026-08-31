@@ -137,6 +137,13 @@ def add_sponsored_channel(channel_id: str, title: str, link: str):
     conn.commit()
     conn.close()
 
+def delete_sponsored_channel(channel_id: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
+    conn.commit()
+    conn.close()
+
 
 # =========================================================
 # LOCALIZATION (TEXTS)
@@ -466,10 +473,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not channels:
             await query.edit_message_text("Спонсорських каналів немає.")
             return
-        msg = "📋 **Спонсорські канали:**\n\n"
+        
+        keyboard = []
         for ch in channels:
-            msg += f"• {ch['title']} ({ch['id']})\n{ch['link']}\n\n"
-        await query.edit_message_text(msg, parse_mode="Markdown")
+            # Для кожного каналу створюємо кнопку видалення
+            keyboard.append([
+                InlineKeyboardButton(f"❌ Видалити {ch['title']}", callback_data=f"del_chan:{ch['id']}")
+            ])
+        
+        await query.edit_message_text(
+            "📋 **Керування спонсорськими каналами:**\nНатисніть на канал, щоб видалити його зі списку:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+
+    # Обробка натискання кнопки видалення
+    if data.startswith("del_chan:"):
+        ch_id = data.split(":", 1)[1]
+        delete_sponsored_channel(ch_id)
+        await query.answer("✅ Канал успішно видалено!", show_alert=True)
+        
+        # Оновлюємо список після видалення
+        channels = get_sponsored_channels()
+        if not channels:
+            await query.edit_message_text("Спонсорських каналів більше немає.")
+            return
+            
+        keyboard = []
+        for ch in channels:
+            keyboard.append([
+                InlineKeyboardButton(f"❌ Видалити {ch['title']}", callback_data=f"del_chan:{ch['id']}")
+            ])
+        await query.edit_message_text(
+            "📋 **Керування спонсорськими каналами:**\nНатисніть на канал, щоб видалити його зі списку:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
         return
 
     url = context.user_data.get("url")
