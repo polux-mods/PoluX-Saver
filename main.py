@@ -3,8 +3,8 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
-import subprocess
 import time
 from pathlib import Path
 
@@ -25,7 +25,7 @@ from yt_dlp import YoutubeDL
 
 
 # =========================================================
-# CONFIG
+# CONFIG & PATHS
 # =========================================================
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -33,32 +33,187 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 PORT = int(os.getenv("PORT", "10000"))
 
-# Local Node.js + BgUtils PO-token provider paths prepared by build.sh
+# Telegram ID первинного суперадміна (встанови свій ID у змінні оточення на Render)
+INITIAL_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
 BASE_DIR = Path(__file__).resolve().parent
 LOCAL_NODE_BIN = BASE_DIR / ".node" / "bin"
 BGUTIL_DIR = BASE_DIR / "bgutil-ytdlp-pot-provider" / "server"
 BGUTIL_MAIN = BGUTIL_DIR / "build" / "main.js"
 BGUTIL_PORT = int(os.getenv("BGUTIL_PORT", "4416"))
 BGUTIL_PROCESS = None
+
 if LOCAL_NODE_BIN.is_dir():
     os.environ["PATH"] = str(LOCAL_NODE_BIN) + os.pathsep + os.environ.get("PATH", "")
 
 MAX_FILE_SIZE = 49 * 1024 * 1024
 MAX_PLAYLIST_ITEMS = 15
-
-# Optional YouTube cookies. Keep this EMPTY unless you intentionally configure
-# a cookies file on Render. Never put cookies.txt into GitHub.
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
+DB_FILE = BASE_DIR / "bot_database.db"
 
+
+# =========================================================
+# DATABASE SYSTEM (SQLite)
+# =========================================================
+
+def init_db():
+    """Створення таблиць бази даних при старті."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Таблиця користувачів та мов
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            lang TEXT DEFAULT 'ua'
+        )
+    """)
+    
+    # Таблиця адмінів
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY
+        )
+    """)
+    
+    # Таблиця рекламних / спонсорських каналів
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            channel_id TEXT PRIMARY KEY,
+            title TEXT,
+            invite_link TEXT
+        )
+    """)
+    
+    # Додаємо первинного адміна з ENV
+    if INITIAL_ADMIN_ID > 0:
+        cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (INITIAL_ADMIN_ID,))
+        
+    conn.commit()
+    conn.close()
+
+def get_user_lang(user_id: int) -> str:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else "ua"
+
+def set_user_lang(user_id: int, lang: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO users (user_id, lang) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET lang = excluded.lang
+    """, (user_id, lang))
+    conn.commit()
+    conn.close()
+
+def is_admin(user_id: int) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None or user_id == INITIAL_ADMIN_ID
+
+def add_admin(user_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_sponsored_channels():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT channel_id, title, invite_link FROM channels")
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"id": r[0], "title": r[1], "link": r[2]} for r in rows]
+
+def add_sponsored_channel(channel_id: str, title: str, link: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO channels (channel_id, title, invite_link) VALUES (?, ?, ?)",
+                   (channel_id, title, link))
+    conn.commit()
+    conn.close()
+
+def remove_sponsored_channel(channel_id: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# LOCALIZATION (TEXTS)
+# =========================================================
+
+TEXTS = {
+    "ua": {
+        "start": "Привіт! 👋\nНадішли посилання на YouTube або YouTube Music.\nМожна відео, трек або плейлист.",
+        "choose_format": "Обери формат:",
+        "audio_btn": "🎵 Аудіо",
+        "video_btn": "🎬 Відео",
+        "download_audio": "🎵 Завантажити аудіо",
+        "settings": "⚙️ Налаштування\nПоточна мова: Українська 🇺🇦",
+        "change_lang": "Змінити мову",
+        "lang_set": "Мову успішно змінено на Українську 🇺🇦",
+        "sub_required": "⚠️ **Для використання бота підпишіться на наші канали-спонсори:**",
+        "check_sub_btn": "🔄 Перевірити підписку",
+        "sub_success": "✅ Дякуємо за підписку! Надішліть посилання ще раз.",
+        "sub_failed": "❌ Ви підписалися не на всі канали!",
+        "invalid_url": "❌ Надішли коректне посилання YouTube або YouTube Music.",
+    },
+    "en": {
+        "start": "Hello! 👋\nSend a YouTube or YouTube Music link.\nVideo, track, or playlist supported.",
+        "choose_format": "Choose format:",
+        "audio_btn": "🎵 Audio",
+        "video_btn": "🎬 Video",
+        "download_audio": "🎵 Download audio",
+        "settings": "⚙️ Settings\nCurrent language: English 🇬🇧",
+        "change_lang": "Change language",
+        "lang_set": "Language successfully set to English 🇬🇧",
+        "sub_required": "⚠️ **Please subscribe to our sponsor channels to use the bot:**",
+        "check_sub_btn": "🔄 Check subscription",
+        "sub_success": "✅ Thank you for subscribing! Please send the link again.",
+        "sub_failed": "❌ You have not subscribed to all channels!",
+        "invalid_url": "❌ Please send a valid YouTube or YouTube Music link.",
+    }
+}
+
+
+# =========================================================
+# SPONSOR SUB CHECKER
+# =========================================================
+
+async def check_user_subscriptions(bot, user_id: int):
+    """Повертає список каналів, на які користувач ЩЕ НЕ підписався."""
+    channels = get_sponsored_channels()
+    unsubscribed = []
+    
+    for ch in channels:
+        try:
+            member = await bot.get_chat_member(chat_id=ch["id"], user_id=user_id)
+            if member.status not in ["creator", "administrator", "member"]:
+                unsubscribed.append(ch)
+        except Exception as e:
+            logger.warning("Could not check membership for channel %s: %s", ch["id"], e)
+            # Якщо бот не адмін у каналі або ID невідомий — вважаємо, що потрібно підписатися
+            unsubscribed.append(ch)
+            
+    return unsubscribed
+
+
+# =========================================================
+# YT-DLP CORE LOGIC
+# =========================================================
 
 def youtube_options_base():
-    """Common yt-dlp options for YouTube on Render.
-
-    The BgUtils provider is run as a local HTTP server on 127.0.0.1:4416.
-    yt-dlp's bgutil plugin then obtains a fresh PO token for the requested
-    video. This is the recommended setup from the current yt-dlp PO-token
-    guide.
-    """
     options = {
         "retries": 3,
         "fragment_retries": 3,
@@ -72,19 +227,11 @@ def youtube_options_base():
             "Accept-Language": "en-US,en;q=0.9",
         },
         "extractor_args": {
-            "youtube": {
-                "player_client": ["android_vr", "mweb"],
-            },
-            "youtubepot-bgutilhttp": {
-                "base_url": f"http://127.0.0.1:{BGUTIL_PORT}",
-            },
+            "youtube": {"player_client": ["android_vr", "mweb"]},
+            "youtubepot-bgutilhttp": {"base_url": f"http://127.0.0.1:{BGUTIL_PORT}"},
         },
-        # yt-dlp 2026.x expects {runtime: {config}}, not {runtime: path}.
-        # The path is therefore supplied under the runtime's "path" config.
         "js_runtimes": {
-            "node": {
-                "path": str(LOCAL_NODE_BIN / "node"),
-            }
+            "node": {"path": str(LOCAL_NODE_BIN / "node")}
         },
     }
 
@@ -92,26 +239,17 @@ def youtube_options_base():
         cookie_path = Path(YOUTUBE_COOKIES)
         if cookie_path.is_file():
             options["cookiefile"] = str(cookie_path)
-        else:
-            logger.warning("YOUTUBE_COOKIES is set but file does not exist: %s", cookie_path)
 
     return options
 
 
 def start_bgutil_provider():
-    """Start BgUtils HTTP provider if its compiled server exists."""
     global BGUTIL_PROCESS
-
     if not BGUTIL_MAIN.is_file():
-        logger.error("BgUtils server not found: %s", BGUTIL_MAIN)
         return False
-
     node = LOCAL_NODE_BIN / "node"
     if not node.is_file():
-        logger.error("Local Node.js not found: %s", node)
         return False
-
-    logger.info("Starting BgUtils PO-token provider on 127.0.0.1:%s", BGUTIL_PORT)
 
     BGUTIL_PROCESS = subprocess.Popen(
         [str(node), str(BGUTIL_MAIN), "--port", str(BGUTIL_PORT)],
@@ -121,31 +259,23 @@ def start_bgutil_provider():
         env=os.environ.copy(),
     )
 
-    # Give the server a moment to bind its port.
     import urllib.request
     deadline = time.time() + 15
     while time.time() < deadline:
         if BGUTIL_PROCESS.poll() is not None:
-            logger.error("BgUtils process exited with code %s", BGUTIL_PROCESS.returncode)
             return False
         try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{BGUTIL_PORT}/ping", timeout=1
-            ) as response:
-                if response.status == 200:
-                    logger.info("BgUtils PO-token provider is ready")
+            with urllib.request.urlopen(f"http://127.0.0.1:{BGUTIL_PORT}/ping", timeout=1) as resp:
+                if resp.status == 200:
                     return True
         except Exception:
             time.sleep(0.25)
-
-    logger.error("BgUtils provider did not become ready within 15 seconds")
     return False
 
 
 def stop_bgutil_provider():
     global BGUTIL_PROCESS
     if BGUTIL_PROCESS is not None and BGUTIL_PROCESS.poll() is None:
-        logger.info("Stopping BgUtils PO-token provider...")
         BGUTIL_PROCESS.terminate()
         try:
             BGUTIL_PROCESS.wait(timeout=5)
@@ -155,17 +285,9 @@ def stop_bgutil_provider():
 
 
 def human_youtube_error(error: Exception) -> str:
-    """Turn common yt-dlp errors into a useful Telegram message."""
     text = str(error)
-    if "Sign in to confirm you’re not a bot" in text or "Sign in to confirm you're not a bot" in text:
-        return (
-            "YouTube заблокував запит із сервера (anti-bot).\n\n"
-            "Це не помилка Telegram або Render. Спробуй інше відео. "
-            "Якщо блокування повторюється для всіх відео, потрібно буде "
-            "підключити YouTube cookies або PO Token."
-        )
-    if "Requested format is not available" in text:
-        return "Для цього відео YouTube не надав потрібний формат."
+    if "Sign in to confirm you’re not a bot" in text:
+        return "YouTube заблокував запит із сервера (anti-bot). Підключіть cookies."
     return text[:1000]
 
 
@@ -177,79 +299,32 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-
 logger = logging.getLogger(__name__)
 
-
-# =========================================================
-# CHECK CONFIG
-# =========================================================
-
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is not configured")
-
-if not PUBLIC_URL:
-    raise RuntimeError("PUBLIC_URL is not configured")
-
+if not TOKEN or not PUBLIC_URL:
+    raise RuntimeError("BOT_TOKEN or PUBLIC_URL is missing!")
 
 WEBHOOK_URL = f"{PUBLIC_URL}/telegram/webhook"
 
 
-# =========================================================
-# YOUTUBE URL CHECK
-# =========================================================
-
 def is_youtube_url(url: str) -> bool:
-    pattern = (
-        r"^https?://"
-        r"(www\.)?"
-        r"(youtube\.com|youtu\.be|music\.youtube\.com)/"
-    )
-
+    pattern = r"^https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/"
     return bool(re.match(pattern, url, re.IGNORECASE))
 
 
 def is_youtube_music_url(url: str) -> bool:
-    return bool(
-        re.match(
-            r"^https?://music\.youtube\.com/",
-            url,
-            re.IGNORECASE,
-        )
-    )
+    return bool(re.match(r"^https?://music\.youtube\.com/", url, re.IGNORECASE))
 
-
-# =========================================================
-# YT-DLP INFO
-# =========================================================
 
 def extract_info(url: str):
-
     options = youtube_options_base()
-    options.update({
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "extract_flat": "in_playlist",
-    })
-
+    options.update({"quiet": True, "no_warnings": True, "skip_download": True, "extract_flat": "in_playlist"})
     with YoutubeDL(options) as ydl:
-        return ydl.extract_info(
-            url,
-            download=False,
-        )
+        return ydl.extract_info(url, download=False)
 
-
-# =========================================================
-# DOWNLOAD AUDIO
-# =========================================================
 
 def download_audio(url: str, workdir: str):
-
-    output = str(
-        Path(workdir) / "%(title).80s.%(ext)s"
-    )
-
+    output = str(Path(workdir) / "%(title).80s.%(ext)s")
     options = youtube_options_base()
     options.update({
         "format": "bestaudio/best",
@@ -257,939 +332,238 @@ def download_audio(url: str, workdir: str):
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-
-                "preferredcodec": "mp3",
-
-                "preferredquality": "128",
-            }
-        ],
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
     })
-
     with YoutubeDL(options) as ydl:
-
-        info = ydl.extract_info(
-            url,
-            download=True,
-        )
-
+        info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-
-        mp3_file = str(
-            Path(filename).with_suffix(".mp3")
-        )
-
+        mp3_file = str(Path(filename).with_suffix(".mp3"))
         if os.path.exists(mp3_file):
-
             return mp3_file, info
-
-        mp3_files = list(
-            Path(workdir).glob("*.mp3")
-        )
-
+        mp3_files = list(Path(workdir).glob("*.mp3"))
         if mp3_files:
-
             return str(mp3_files[0]), info
+        raise FileNotFoundError("MP3 not found")
 
-        raise FileNotFoundError(
-            "MP3 file was not created."
-        )
-
-
-# =========================================================
-# DOWNLOAD VIDEO
-# =========================================================
 
 def download_video(url: str, workdir: str):
-
-    output = str(
-        Path(workdir) / "%(title).80s.%(ext)s"
-    )
-
+    output = str(Path(workdir) / "%(title).80s.%(ext)s")
     options = youtube_options_base()
     options.update({
-
-        "format": (
-            "best[ext=mp4][height<=720]/"
-            "bestvideo[ext=mp4][height<=720]+"
-            "bestaudio[ext=m4a]/"
-            "best[height<=720]/"
-            "best"
-        ),
-
+        "format": "best[ext=mp4][height<=720]/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best",
         "outtmpl": output,
-
         "merge_output_format": "mp4",
-
         "noplaylist": True,
-
         "quiet": True,
         "no_warnings": True,
     })
-
     with YoutubeDL(options) as ydl:
-
-        info = ydl.extract_info(
-            url,
-            download=True,
-        )
-
+        info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-
-        mp4_file = str(
-            Path(filename).with_suffix(".mp4")
-        )
-
+        mp4_file = str(Path(filename).with_suffix(".mp4"))
         if os.path.exists(mp4_file):
-
             return mp4_file, info
-
-        if os.path.exists(filename):
-
-            return filename, info
-
-        video_files = [
-
-            p
-
-            for p in Path(workdir).iterdir()
-
-            if p.is_file()
-
-            and p.suffix.lower()
-            in {
-                ".mp4",
-                ".mkv",
-                ".webm",
-                ".mov",
-            }
-        ]
-
+        video_files = [p for p in Path(workdir).iterdir() if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm"}]
         if video_files:
-
             return str(video_files[0]), info
-
-        raise FileNotFoundError(
-            "Video file was not created."
-        )
+        raise FileNotFoundError("Video not found")
 
 
 # =========================================================
-# CLEANUP
+# TELEGRAM HANDLERS
 # =========================================================
 
-def cleanup(workdir: str):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(update.effective_user.id)
+    await update.message.reply_text(TEXTS[lang]["start"])
 
-    shutil.rmtree(
-        workdir,
-        ignore_errors=True,
-    )
 
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(update.effective_user.id)
+    keyboard = [[InlineKeyboardButton(TEXTS[lang]["change_lang"], callback_data="toggle_lang")]]
+    await update.message.reply_text(TEXTS[lang]["settings"], reply_markup=InlineKeyboardMarkup(keyboard))
 
-# =========================================================
-# SEND AUDIO
-# =========================================================
 
-async def send_audio(
-    context,
-    chat_id,
-    filepath,
-    info,
-):
-
-    size = os.path.getsize(filepath)
-
-    if size > MAX_FILE_SIZE:
-
-        return (
-            False,
-            f"Файл має {size / 1024 / 1024:.1f} МБ "
-            f"і перевищує ліміт Telegram.",
-        )
-
-    title = (
-        info.get("title")
-        or "audio"
-    )[:64]
-
-    performer = (
-        info.get("artist")
-        or info.get("uploader")
-    )
-
-    if performer:
-
-        performer = performer[:64]
-
-    duration = info.get("duration")
-
-    with open(
-        filepath,
-        "rb",
-    ) as audio:
-
-        await context.bot.send_audio(
-
-            chat_id=chat_id,
-
-            audio=audio,
-
-            filename="audio.mp3",
-
-            title=title,
-
-            performer=performer,
-
-            duration=(
-                int(duration)
-                if duration
-                else None
-            ),
-        )
-
-    return True, None
-
-
-# =========================================================
-# SEND VIDEO
-# =========================================================
-
-async def send_video(
-    context,
-    chat_id,
-    filepath,
-    info,
-):
-
-    size = os.path.getsize(filepath)
-
-    if size > MAX_FILE_SIZE:
-
-        return (
-            False,
-            f"Відео має {size / 1024 / 1024:.1f} МБ "
-            f"і перевищує ліміт Telegram.",
-        )
-
-    duration = info.get("duration")
-
-    width = info.get("width")
-
-    height = info.get("height")
-
-    with open(
-        filepath,
-        "rb",
-    ) as video:
-
-        await context.bot.send_video(
-
-            chat_id=chat_id,
-
-            video=video,
-
-            filename="video.mp4",
-
-            duration=(
-                int(duration)
-                if duration
-                else None
-            ),
-
-            width=(
-                int(width)
-                if width
-                else None
-            ),
-
-            height=(
-                int(height)
-                if height
-                else None
-            ),
-
-            supports_streaming=True,
-        )
-
-    return True, None
-
-
-# =========================================================
-# DOWNLOAD + SEND
-# =========================================================
-
-async def download_and_send(
-    context,
-    chat_id,
-    url,
-    choice,
-    status_message,
-):
-
-    workdir = tempfile.mkdtemp(
-        prefix="yt_tg_"
-    )
-
-    try:
-
-        await status_message.edit_text(
-            "⏳ Отримую інформацію про відео..."
-        )
-
-        info = await asyncio.to_thread(
-            extract_info,
-            url,
-        )
-
-        if not info:
-
-            raise RuntimeError(
-                "YouTube не повернув інформацію."
-            )
-
-        # AUDIO
-
-        if choice == "audio":
-
-            await status_message.edit_text(
-                "🎵 Завантажую аудіо..."
-            )
-
-            filepath, info = await asyncio.to_thread(
-                download_audio,
-                url,
-                workdir,
-            )
-
-            await status_message.edit_text(
-                "📤 Відправляю аудіо..."
-            )
-
-            return await send_audio(
-                context,
-                chat_id,
-                filepath,
-                info,
-            )
-
-        # VIDEO
-
-        await status_message.edit_text(
-            "🎬 Завантажую відео..."
-        )
-
-        filepath, info = await asyncio.to_thread(
-            download_video,
-            url,
-            workdir,
-        )
-
-        await status_message.edit_text(
-            "📤 Відправляю відео..."
-        )
-
-        return await send_video(
-            context,
-            chat_id,
-            filepath,
-            info,
-        )
-
-    finally:
-
-        cleanup(workdir)
-
-
-# =========================================================
-# /START
-# =========================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.message.reply_text(
-
-        "Привіт! 👋\n\n"
-
-        "Надішли посилання на YouTube "
-        "або YouTube Music.\n\n"
-
-        "Можна відео, трек або плейлист."
-    )
-
-
-# =========================================================
-# RECEIVE URL
-# =========================================================
-
-async def receive_url(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not update.message:
-
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
         return
 
-    if not update.message.text:
+    keyboard = [
+        [InlineKeyboardButton("➕ Додати адміна", callback_data="admin_add_admin")],
+        [InlineKeyboardButton("📢 Додати спонсорський канал", callback_data="admin_add_channel")],
+        [InlineKeyboardButton("📋 Список спонсорів", callback_data="admin_list_channels")],
+    ]
+    await update.message.reply_text("🔑 **Панель адміністратора**", reply_markup=InlineKeyboardMarkup(keyboard))
 
+
+async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
         return
 
     url = update.message.text.strip()
+    user_id = update.effective_user.id
+    lang = get_user_lang(user_id)
 
-    if not is_youtube_url(url):
-
+    # 1. ПЕРЕВІРКА СПОНСОРСЬКИХ ПІДПИСОК
+    unsubscribed = await check_user_subscriptions(context.bot, user_id)
+    if unsubscribed:
+        keyboard = []
+        for ch in unsubscribed:
+            keyboard.append([InlineKeyboardButton(f"👉 {ch['title']}", url=ch['link'])])
+        keyboard.append([InlineKeyboardButton(TEXTS[lang]["check_sub_btn"], callback_data="check_subscription")])
+        
         await update.message.reply_text(
-
-            "❌ Надішли коректне посилання "
-            "YouTube або YouTube Music."
+            TEXTS[lang]["sub_required"],
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
         )
+        return
 
+    # 2. ПЕРЕВІРКА YOUTUBE ПОСИЛАННЯ
+    if not is_youtube_url(url):
+        await update.message.reply_text(TEXTS[lang]["invalid_url"])
         return
 
     context.user_data["url"] = url
 
-    # YOUTUBE MUSIC
-
     if is_youtube_music_url(url):
-
-        keyboard = [
-
-            [
-
-                InlineKeyboardButton(
-                    "🎵 Завантажити аудіо",
-                    callback_data="audio",
-                )
-
-            ]
-
-        ]
-
-        text = (
-            "🎵 YouTube Music\n\n"
-            "Завантажити як аудіо?"
-        )
-
-    # NORMAL YOUTUBE
-
+        keyboard = [[InlineKeyboardButton(TEXTS[lang]["download_audio"], callback_data="audio")]]
+        text = "🎵 YouTube Music"
     else:
+        keyboard = [[
+            InlineKeyboardButton(TEXTS[lang]["audio_btn"], callback_data="audio"),
+            InlineKeyboardButton(TEXTS[lang]["video_btn"], callback_data="video"),
+        ]]
+        text = TEXTS[lang]["choose_format"]
 
-        keyboard = [
-
-            [
-
-                InlineKeyboardButton(
-                    "🎵 Аудіо",
-                    callback_data="audio",
-                ),
-
-                InlineKeyboardButton(
-                    "🎬 Відео",
-                    callback_data="video",
-                ),
-
-            ]
-
-        ]
-
-        text = "Обери формат:"
-
-    await update.message.reply_text(
-
-        text,
-
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        ),
-    )
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-# =========================================================
-# BUTTON
-# =========================================================
-
-async def process_download(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-
     await query.answer()
+    user_id = update.effective_user.id
+    lang = get_user_lang(user_id)
+    data = query.data
 
-    url = context.user_data.get("url")
-
-    if not url:
-
-        await query.edit_message_text(
-
-            "❌ Посилання втрачено.\n"
-            "Надішли його ще раз."
-        )
-
+    # Зміна мови
+    if data == "toggle_lang":
+        new_lang = "en" if lang == "ua" else "ua"
+        set_user_lang(user_id, new_lang)
+        await query.edit_message_text(TEXTS[new_lang]["lang_set"])
         return
 
-    choice = query.data
-
-    status = await query.edit_message_text(
-        "⏳ Перевіряю посилання..."
-    )
-
-    try:
-
-        info = await asyncio.to_thread(
-            extract_info,
-            url,
-        )
-
-        # =================================================
-        # PLAYLIST
-        # =================================================
-
-        if (
-            info.get("_type") == "playlist"
-            or info.get("entries")
-        ):
-
-            entries = [
-
-                item
-
-                for item
-                in (info.get("entries") or [])
-
-                if item
-
-            ]
-
-            entries = entries[
-                :MAX_PLAYLIST_ITEMS
-            ]
-
-            if not entries:
-
-                await status.edit_text(
-                    "❌ Плейлист порожній "
-                    "або недоступний."
-                )
-
-                return
-
-            await status.edit_text(
-
-                f"📋 Знайдено "
-                f"{len(entries)} елементів.\n\n"
-                f"Починаю завантаження..."
-            )
-
-            success = 0
-
-            failed = 0
-
-            for index, entry in enumerate(
-                entries,
-                start=1,
-            ):
-
-                entry_url = (
-                    entry.get("webpage_url")
-                    or entry.get("url")
-                )
-
-                if (
-                    entry_url
-                    and not entry_url.startswith(
-                        "http"
-                    )
-                ):
-
-                    entry_url = (
-                        "https://www.youtube.com/watch?v="
-                        + entry_url
-                    )
-
-                if not entry_url:
-
-                    failed += 1
-
-                    continue
-
-                try:
-
-                    await status.edit_text(
-
-                        f"⏳ {index}/"
-                        f"{len(entries)} "
-                        f"— завантажую..."
-                    )
-
-                    ok, error = (
-                        await download_and_send(
-
-                            context,
-
-                            query.message.chat_id,
-
-                            entry_url,
-
-                            choice,
-
-                            status,
-                        )
-                    )
-
-                    if ok:
-
-                        success += 1
-
-                    else:
-
-                        failed += 1
-
-                        await context.bot.send_message(
-
-                            chat_id=query.message.chat_id,
-
-                            text=(
-                                f"⚠️ Елемент {index}: "
-                                f"{error}"
-                            ),
-                        )
-
-                except Exception as error:
-
-                    failed += 1
-
-                    logger.exception(
-                        "Playlist item failed"
-                    )
-
-                    await context.bot.send_message(
-
-                        chat_id=query.message.chat_id,
-
-                        text=(
-                            f"⚠️ Елемент {index} "
-                            f"не завантажено:\n"
-                            f"{human_youtube_error(error)}"
-                        ),
-                    )
-
-            await status.edit_text(
-
-                f"✅ Готово!\n\n"
-                f"Успішно: {success}\n"
-                f"Помилок: {failed}"
-            )
-
-            return
-
-        # =================================================
-        # SINGLE VIDEO
-        # =================================================
-
-        ok, error = await download_and_send(
-
-            context,
-
-            query.message.chat_id,
-
-            url,
-
-            choice,
-
-            status,
-        )
-
-        if ok:
-
-            await status.delete()
-
+    # Перевірка підписки за кнопкою
+    if data == "check_subscription":
+        unsubscribed = await check_user_subscriptions(context.bot, user_id)
+        if not unsubscribed:
+            await query.edit_message_text(TEXTS[lang]["sub_success"])
         else:
+            await query.answer(TEXTS[lang]["sub_failed"], show_alert=True)
+        return
 
-            await status.edit_text(
-                f"❌ {error}"
-            )
+    # АДМІН ДІЇ
+    if data == "admin_add_admin":
+        context.user_data["admin_state"] = "await_admin_id"
+        await query.edit_message_text("Надішліть Telegram ID користувача, якому хочете надати права адміна:")
+        return
 
-    except Exception as error:
-
-        logger.exception(
-            "Download failed"
+    if data == "admin_add_channel":
+        context.user_data["admin_state"] = "await_channel_data"
+        await query.edit_message_text(
+            "Надішліть дані каналу у такому форматі (через пробіл):\n"
+            "`@channel_id Назва_Каналу https://t.me/link`\n\n"
+            "⚠️ **Бот повинен бути доданий в цей канал як АДМІНІСТРАТОР!**",
+            parse_mode="Markdown"
         )
-
-        await status.edit_text(
-
-            "❌ Помилка під час завантаження:\n\n"
-            f"{human_youtube_error(error)}"
-        )
-
-
-# =========================================================
-# ERROR HANDLER
-# =========================================================
-
-async def error_handler(
-    update,
-    context,
-):
-
-    logger.error(
-        "Telegram error: %s",
-        context.error,
-        exc_info=context.error,
-    )
-
-
-# =========================================================
-# TELEGRAM APPLICATION
-# =========================================================
-
-telegram_app = (
-
-    Application.builder()
-
-    .token(TOKEN)
-
-    .updater(None)
-
-    .build()
-)
-
-
-telegram_app.add_handler(
-    CommandHandler(
-        "start",
-        start,
-    )
-)
-
-
-telegram_app.add_handler(
-
-    MessageHandler(
-
-        filters.TEXT
-        & ~filters.COMMAND,
-
-        receive_url,
-    )
-)
-
-
-telegram_app.add_handler(
-
-    CallbackQueryHandler(
-        process_download
-    )
-)
-
-
-telegram_app.add_error_handler(
-    error_handler
-)
-
-
-# =========================================================
-# FASTAPI
-# =========================================================
-
-app = FastAPI()
-
-
-@app.get("/")
-async def root():
-
-    return PlainTextResponse(
-        "YouTube Telegram Bot is running."
-    )
-
-
-@app.get("/health")
-async def health():
-
-    return {
-        "status": "ok"
-    }
-
-
-@app.get("/debug/youtube")
-async def debug_youtube():
-    return {
-        "node_exists": (LOCAL_NODE_BIN / "node").is_file(),
-        "bgutil_main_exists": BGUTIL_MAIN.is_file(),
-        "bgutil_running": BGUTIL_PROCESS is not None and BGUTIL_PROCESS.poll() is None,
-        "bgutil_port": BGUTIL_PORT,
-        "cookies_configured": bool(YOUTUBE_COOKIES),
-        "player_clients": ["android_vr", "mweb"],
-    }
-
-
-@app.get("/debug/webhook")
-async def debug_webhook():
-
-    info = (
-        await telegram_app.bot
-        .get_webhook_info()
-    )
-
-    return {
-
-        "webhook_url": info.url,
-
-        "pending_updates":
-            info.pending_update_count,
-
-        "last_error":
-            info.last_error_message,
-
-        "last_error_date":
-            info.last_error_date,
-
-        "expected_webhook":
-            WEBHOOK_URL,
-    }
-
-
-# =========================================================
-# TELEGRAM WEBHOOK
-# =========================================================
-
-@app.post("/telegram/webhook")
-async def telegram_webhook(
-    request: Request,
-):
-
-    # Verify secret
-
-    if WEBHOOK_SECRET:
-
-        provided_secret = (
-            request.headers.get(
-                "X-Telegram-Bot-Api-Secret-Token",
-                ""
-            )
-        )
-
-        if (
-            provided_secret
-            != WEBHOOK_SECRET
-        ):
-
-            raise HTTPException(
-                status_code=401,
-                detail="Unauthorized",
-            )
-
-    data = await request.json()
-
-    update = Update.de_json(
-        data,
-        telegram_app.bot,
-    )
-
-    # Put update into PTB queue
-
-    await telegram_app.update_queue.put(
-        update
-    )
-
-    return PlainTextResponse(
-        "OK"
-    )
-
-
-# =========================================================
-# STARTUP
-# =========================================================
-
-@app.on_event("startup")
-async def startup():
-
-    if not start_bgutil_provider():
-        logger.warning("BgUtils PO-token provider is unavailable; YouTube may reject requests.")
-
-    logger.info(
-        "Starting Telegram application..."
-    )
-
-    await telegram_app.initialize()
-
-    await telegram_app.start()
-
-    logger.info(
-        "Setting Telegram webhook:"
-    )
-
-    logger.info(
-        WEBHOOK_URL
-    )
-
-    await telegram_app.bot.set_webhook(
-
-        url=WEBHOOK_URL,
-
-        secret_token=(
-            WEBHOOK_SECRET
-            if WEBHOOK_SECRET
-            else None
-        ),
-
-        allowed_updates=Update.ALL_TYPES,
-
-        drop_pending_updates=False,
-    )
-
-    info = (
-        await telegram_app.bot
-        .get_webhook_info()
-    )
-
-    logger.info(
-        "Telegram webhook URL: %s",
-        info.url,
-    )
-
-    logger.info(
-        "Pending updates: %s",
-        info.pending_update_count,
-    )
-
-
-# =========================================================
-# SHUTDOWN
-# =========================================================
-
-@app.on_event("shutdown")
-async def shutdown():
-
-    logger.info("Shutting down Telegram application...")
+        return
+
+    if data == "admin_list_channels":
+        channels = get_sponsored_channels()
+        if not channels:
+            await query.edit_message_text("Спонсорських каналів немає.")
+            return
+        msg = "📋 **Спонсорські канали:**\n\n"
+        for ch in channels:
+            msg += f"• {ch['title']} ({ch['id']})\n{ch['link']}\n\n"
+        await query.edit_message_text(msg, parse_mode="Markdown")
+        return
+
+    # СКАЧУВАННЯ ВІДЕО / АУДІО
+    url = context.user_data.get("url")
+    if not url:
+        await query.edit_message_text("❌ Посилання втрачено. Надішли його ще раз.")
+        return
+
+    status = await query.edit_message_text("⏳ Завантажую...")
+    workdir = tempfile.mkdtemp(prefix="yt_tg_")
 
     try:
-        await telegram_app.stop()
+        if data == "audio":
+            filepath, info = await asyncio.to_thread(download_audio, url, workdir)
+            with open(filepath, "rb") as f:
+                await context.bot.send_audio(
+                    chat_id=query.message.chat_id,
+                    audio=f,
+                    title=info.get("title", "audio")[:64],
+                    performer=info.get("artist") or info.get("uploader"),
+                    duration=int(info.get("duration", 0)) or None,
+                )
+        else:
+            filepath, info = await asyncio.to_thread(download_video, url, workdir)
+            with open(filepath, "rb") as f:
+                await context.bot.send_video(
+                    chat_id=query.message.chat_id,
+                    video=f,
+                    supports_streaming=True,
+                    duration=int(info.get("duration", 0)) or None,
+                )
+        await status.delete()
+    except Exception as error:
+        logger.exception("Download failed")
+        await status.edit_text(f"❌ Помилка: {human_youtube_error(error)}")
     finally:
-        await telegram_app.shutdown()
-        stop_bgutil_provider()
+        shutil.rmtree(workdir, ignore_errors=True)
 
-    logger.info("Telegram application stopped.")
+
+async def handle_admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробник тексту для введення ID адміна або даних каналу."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+
+    state = context.user_data.get("admin_state")
+    if not state:
+        return
+
+    text = update.message.text.strip()
+
+    if state == "await_admin_id":
+        if text.isdigit():
+            add_admin(int(text))
+            await update.message.reply_text(f"✅ Користувача `{text}` успішно додано до адмінів!", parse_mode="Markdown")
+            context.user_data["admin_state"] = None
+        else:
+            await update.message.reply_text("❌ Введіть числовий Telegram ID.")
+
+    elif state == "await_channel_data":
+        parts = text.split(maxsplit=2)
+        if len(parts) == 3:
+            ch_id, title, link = parts
+            add_sponsored_channel(ch_id, title, link)
+            await update.message.reply_text(f"✅ Канал `{title}` додано до списку спонсорів!", parse_mode="Markdown")
+            context.user_data["admin_state"] = None
+        else:
+            await update.message.reply_text("❌ Невірний формат. Введіть: `@channel_id Назва Посилання`")
+
 
 # =========================================================
-# RUN
+# APPLICATION SETUP
 # =========================================================
 
-if __name__ == "__main__":
+telegram_app = Application.builder().token(TOKEN).updater(None).build()
 
-    import uvicorn
-
-    uvicorn.run(
-
-        app,
-
-        host="0.0.0.0",
-
-        port=PORT,
-            )
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CommandHandler("settings", settings_command))
+telegram_a
