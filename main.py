@@ -523,6 +523,8 @@ def get_video_formats_info(url: str):
 
 def download_audio(url: str, workdir: str):
     output = str(Path(workdir) / "%(title).80s.%(ext)s")
+    
+    # Основний конфіг з конвертацією обкладинки .webp -> .jpg
     options = youtube_options_base()
     options.update({
         "format": "bestaudio/best",
@@ -532,22 +534,71 @@ def download_audio(url: str, workdir: str):
         "quiet": True,
         "no_warnings": True,
         "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"},
-            {"key": "FFmpegThumbnailsConvertor", "format": "jpg"},
-            {"key": "FFmpegEmbedThumbnail"},
-            {"key": "FFmpegMetadata"}
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "128",
+            },
+            {
+                "key": "FFmpegThumbnailsConvertor",
+                "format": "jpg",
+            },
+            {
+                "key": "FFmpegMetadata",
+                "add_metadata": True,
+            },
+            {
+                "key": "EmbedThumbnail",
+                "already_have_thumbnail": False,
+            },
         ],
     })
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        mp3_file = str(Path(filename).with_suffix(".mp3"))
-        if os.path.exists(mp3_file):
-            return mp3_file, info
-        mp3_files = list(Path(workdir).glob("*.mp3"))
-        if mp3_files:
-            return str(mp3_files[0]), info
-        raise FileNotFoundError("MP3 not found")
+
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            mp3_file = str(Path(filename).with_suffix(".mp3"))
+            if os.path.exists(mp3_file):
+                return mp3_file, info
+            mp3_files = list(Path(workdir).glob("*.mp3"))
+            if mp3_files:
+                return str(mp3_files[0]), info
+    except Exception as e:
+        logger.warning("Не вдалося вшити обкладинку (%s). Завантажуємо MP3 без обкладинки...", e)
+        
+        # Резервний режим: завантаження чистого MP3 без обкладинки
+        fallback_options = youtube_options_base()
+        fallback_options.update({
+            "format": "bestaudio/best",
+            "outtmpl": output,
+            "writethumbnail": False,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "128",
+                },
+                {
+                    "key": "FFmpegMetadata",
+                    "add_metadata": True,
+                },
+            ],
+        })
+        with YoutubeDL(fallback_options) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            mp3_file = str(Path(filename).with_suffix(".mp3"))
+            if os.path.exists(mp3_file):
+                return mp3_file, info
+            mp3_files = list(Path(workdir).glob("*.mp3"))
+            if mp3_files:
+                return str(mp3_files[0]), info
+
+    raise FileNotFoundError("MP3 файл не знайдено.")
 
 
 def download_video_quality(url: str, workdir: str, height: int):
