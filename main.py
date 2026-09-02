@@ -13,7 +13,14 @@ from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse, FileResponse
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -49,8 +56,8 @@ if LOCAL_NODE_BIN.is_dir():
     os.environ["PATH"] = str(LOCAL_NODE_BIN) + os.pathsep + os.environ.get("PATH", "")
 
 MAX_FILE_SIZE = 49 * 1024 * 1024
+COOKIES_FILE_PATH = BASE_DIR / "cookies.txt"
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
-DB_FILE = BASE_DIR / "bot_database.db"
 
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 DOWNLOADS_DIR.mkdir(exist_ok=True)
@@ -68,7 +75,7 @@ def get_db_connection():
             db_url = db_url.replace("postgres://", "postgresql://", 1)
         return psycopg2.connect(db_url), True
     else:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(BASE_DIR / "bot_database.db")
         return conn, False
 
 def execute_query(query: str, params: tuple = (), fetchone=False, fetchall=False, commit=False):
@@ -92,6 +99,22 @@ def execute_query(query: str, params: tuple = (), fetchone=False, fetchall=False
     finally:
         conn.close()
 
+def sync_cookies_from_db():
+    """Синхронізує cookies з бази даних у локальний файл cookies.txt."""
+    row = execute_query("SELECT value FROM settings WHERE key = ?", ("youtube_cookies",), fetchone=True)
+    if row and row[0]:
+        COOKIES_FILE_PATH.write_text(row[0], encoding="utf-8")
+    elif YOUTUBE_COOKIES:
+        COOKIES_FILE_PATH.write_text(YOUTUBE_COOKIES, encoding="utf-8")
+
+def save_db_cookies(content: str):
+    """Зберігає cookies у базу даних та файл."""
+    execute_query("""
+        INSERT INTO settings (key, value) VALUES ('youtube_cookies', ?)
+        ON CONFLICT (key) DO UPDATE SET value = excluded.value
+    """, (content,), commit=True)
+    COOKIES_FILE_PATH.write_text(content, encoding="utf-8")
+
 def init_db():
     execute_query("""
         CREATE TABLE IF NOT EXISTS users (
@@ -113,12 +136,21 @@ def init_db():
             invite_link TEXT
         )
     """, commit=True)
+
+    execute_query("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """, commit=True)
     
     if INITIAL_ADMIN_ID > 0:
         execute_query("""
             INSERT INTO admins (user_id) VALUES (?)
             ON CONFLICT (user_id) DO NOTHING
         """, (INITIAL_ADMIN_ID,), commit=True)
+
+    sync_cookies_from_db()
 
 def get_user_lang(user_id: int) -> str | None:
     row = execute_query("SELECT lang FROM users WHERE user_id = ?", (user_id,), fetchone=True)
@@ -143,6 +175,13 @@ def add_admin(user_id: int):
         INSERT INTO admins (user_id) VALUES (?)
         ON CONFLICT (user_id) DO NOTHING
     """, (user_id,), commit=True)
+
+def get_all_admin_ids() -> list[int]:
+    rows = execute_query("SELECT user_id FROM admins", fetchall=True) or []
+    admins = {r[0] for r in rows}
+    if INITIAL_ADMIN_ID > 0:
+        admins.add(INITIAL_ADMIN_ID)
+    return list(admins)
 
 def get_sponsored_channels():
     rows = execute_query("SELECT channel_id, title, invite_link FROM channels", fetchall=True)
@@ -177,13 +216,12 @@ def delete_sponsored_channel(channel_id: str):
 
 TEXTS = {
     "ua": {
-        "select_lang_prompt": "👋 Вітаємо! Будь ласка, оберіть мову спілкування:",
         "start": "Привіт! 👋\nНадішли посилання на YouTube або YouTube Music.\nМожна відео, трек або плейлист.",
         "choose_format": "Обери формат:",
         "audio_btn": "🎵 Аудіо",
         "video_btn": "🎬 Відео",
         "download_audio": "🎵 Завантажити аудіо",
-        "settings": "⚙️ Налаштування\nПоточна мова: Українська 🇺🇦",
+        "settings": "⚙️ **Налаштування**\nОберіть бажану мову інтерфейсу:",
         "change_lang": "🌐 Змінити мову",
         "lang_set": "✅ Мову успішно змінено на Українську 🇺🇦",
         "sub_required": "⚠️ **Для використання бота підпишіться на наші канали-спонсори:**",
@@ -197,7 +235,7 @@ TEXTS = {
         "no_qualities": "❌ Не вдалося отримати варіанти якості для цього відео.",
         "choose_quality": "📹 **{title}**\n\nОберіть бажану якість:",
         "downloading_video": "⏳ Завантажую відео у якості {height}p...",
-        "downloading_audio": "⏳ Завантажую аудіо...",
+        "downloading_audio": "⏳ Завантажую аудіо та обкладинку...",
         "file_too_large_video": "📦 **Файл перевищує 50 МБ** ({mb} МБ).\nTelegram не дозволяє надсилати такі файли напряму.\n\n🔗 [Натисніть сюди, щоб завантажити відео]({link})",
         "file_too_large_audio": "📦 **Аудіо перевищує 50 МБ** ({mb} МБ).\n\n🔗 [Натисніть сюди, щоб завантажити аудіо]({link})",
         "link_lost": "❌ Посилання втрачено. Надішли його ще раз.",
@@ -205,14 +243,17 @@ TEXTS = {
         "admin_add_admin_btn": "➕ Додати адміна",
         "admin_add_channel_btn": "📢 Додати спонсора",
         "admin_list_channels_btn": "📋 Список спонсорів",
+        "admin_cookies_btn": "🍪 Оновити Cookies",
         "admin_enter_admin_id": "Надішліть Telegram ID користувача, якому хочете надати права адміна:",
         "admin_enter_channel_data": "Надішліть дані каналу у такому форматі (через пробіл):\n`@channel_id Назва_Каналу https://t.me/link`\n\n⚠️ **Бот повинен бути доданий в цей канал як АДМІНІСТРАТОР!**",
+        "admin_enter_cookies": "🍪 Надішліть файл `cookies.txt` або його текстовий вміст у повідомленні:",
+        "cookies_updated": "✅ Cookies успішно збережено в хмару та оновлено!",
         "admin_channel_added": "✅ Канал `{title}` додано до списку спонсорів!",
         "admin_invalid_channel_format": "❌ Невірний формат. Введіть: `@channel_id Назва Посилання`",
         "admin_admin_added": "✅ Користувача `{id}` успішно додано до адмінів!",
         "admin_invalid_id": "❌ Введіть числовий Telegram ID.",
         "sponsors_empty": "📋 **Спонсорських каналів немає.**",
-        "sponsors_list_title": "📋 **Керування спонсорськими каналами:**\nОберіть канал для керування:",
+        "sponsors_list_title": "📋 **Керування спонсорськими каналами:**",
         "sponsor_info": "📢 **Канал:** {title}\n🆔 **ID:** `{id}`\n🔗 **Посилання:** {link}",
         "edit_btn": "✏️ Редагувати",
         "delete_btn": "🗑 Видалити",
@@ -221,13 +262,12 @@ TEXTS = {
         "sponsor_updated": "✅ Дані каналу оновлено!",
     },
     "en": {
-        "select_lang_prompt": "👋 Welcome! Please choose your preferred language:",
         "start": "Hello! 👋\nSend a YouTube or YouTube Music link.\nVideo, track, or playlist supported.",
         "choose_format": "Choose format:",
         "audio_btn": "🎵 Audio",
         "video_btn": "🎬 Video",
         "download_audio": "🎵 Download audio",
-        "settings": "⚙️ Settings\nCurrent language: English 🇬🇧",
+        "settings": "⚙️ **Settings**\nSelect your preferred interface language:",
         "change_lang": "🌐 Change language",
         "lang_set": "✅ Language successfully set to English 🇬🇧",
         "sub_required": "⚠️ **Please subscribe to our sponsor channels to use the bot:**",
@@ -241,7 +281,7 @@ TEXTS = {
         "no_qualities": "❌ Could not get quality options for this video.",
         "choose_quality": "📹 **{title}**\n\nChoose desired quality:",
         "downloading_video": "⏳ Downloading video in {height}p quality...",
-        "downloading_audio": "⏳ Downloading audio...",
+        "downloading_audio": "⏳ Downloading audio & cover art...",
         "file_too_large_video": "📦 **File exceeds 50 MB** ({mb} MB).\nTelegram doesn't allow direct sending of large files.\n\n🔗 [Click here to download video]({link})",
         "file_too_large_audio": "📦 **Audio exceeds 50 MB** ({mb} MB).\n\n🔗 [Click here to download audio]({link})",
         "link_lost": "❌ Link lost. Please send it again.",
@@ -249,14 +289,17 @@ TEXTS = {
         "admin_add_admin_btn": "➕ Add Admin",
         "admin_add_channel_btn": "📢 Add Sponsor",
         "admin_list_channels_btn": "📋 Sponsor List",
+        "admin_cookies_btn": "🍪 Update Cookies",
         "admin_enter_admin_id": "Send the Telegram ID of the user you want to promote to admin:",
         "admin_enter_channel_data": "Send channel details in this format (space separated):\n`@channel_id Channel_Name https://t.me/link`\n\n⚠️ **Bot must be an ADMIN in this channel!**",
+        "admin_enter_cookies": "🍪 Send the `cookies.txt` file or paste its content as a message:",
+        "cookies_updated": "✅ Cookies successfully saved to cloud & updated!",
         "admin_channel_added": "✅ Channel `{title}` added to sponsors!",
         "admin_invalid_channel_format": "❌ Invalid format. Enter: `@channel_id Name Link`",
         "admin_admin_added": "✅ User `{id}` added as admin!",
         "admin_invalid_id": "❌ Please enter a numeric Telegram ID.",
         "sponsors_empty": "📋 **No sponsor channels found.**",
-        "sponsors_list_title": "📋 **Sponsor Channel Management:**\nSelect a channel to manage:",
+        "sponsors_list_title": "📋 **Sponsor Channel Management:**",
         "sponsor_info": "📢 **Channel:** {title}\n🆔 **ID:** `{id}`\n🔗 **Link:** {link}",
         "edit_btn": "✏️ Edit",
         "delete_btn": "🗑 Delete",
@@ -272,8 +315,26 @@ def get_text(lang: str, key: str) -> str:
 
 
 # =========================================================
-# HELPER: FIRST-RUN LANGUAGE CHECK
+# HELPER: COMMAND AUTOCOMPLETE & LANGUAGE CHECK
 # =========================================================
+
+async def setup_bot_commands(app_bot):
+    user_commands = [
+        BotCommand("start", "Запустити / Restart"),
+        BotCommand("settings", "Налаштування / Settings")
+    ]
+    await app_bot.set_my_commands(user_commands, scope=BotCommandScopeAllPrivateChats())
+
+    admin_commands = [
+        BotCommand("start", "Запустити / Restart"),
+        BotCommand("settings", "Налаштування / Settings"),
+        BotCommand("admin", "Панель адміністратора / Admin Panel")
+    ]
+    for admin_id in get_all_admin_ids():
+        try:
+            await app_bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception as e:
+            logger.warning("Could not set admin commands for %s: %s", admin_id, e)
 
 def get_language_selection_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -344,10 +405,8 @@ def youtube_options_base():
         },
     }
 
-    if YOUTUBE_COOKIES:
-        cookie_path = Path(YOUTUBE_COOKIES)
-        if cookie_path.is_file():
-            options["cookiefile"] = str(cookie_path)
+    if COOKIES_FILE_PATH.is_file():
+        options["cookiefile"] = str(COOKIES_FILE_PATH)
 
     return options
 
@@ -396,7 +455,7 @@ def stop_bgutil_provider():
 def human_youtube_error(error: Exception) -> str:
     text = str(error)
     if "Sign in to confirm you’re not a bot" in text:
-        return "YouTube заблокував запит із сервера (anti-bot). Підключіть cookies."
+        return "YouTube заблокував запит (anti-bot). Оновіть cookies в адмін-панелі."
     return text[:1000]
 
 
@@ -468,10 +527,16 @@ def download_audio(url: str, workdir: str):
     options.update({
         "format": "bestaudio/best",
         "outtmpl": output,
+        "writethumbnail": True,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"},
+            {"key": "FFmpegThumbnailsConvertor", "format": "jpg"},
+            {"key": "FFmpegEmbedThumbnail"},
+            {"key": "FFmpegMetadata"}
+        ],
     })
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -527,11 +592,15 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = await check_user_language_or_ask(update, context)
     if lang is None:
         return
+    
     keyboard = [
-        [InlineKeyboardButton(get_text(lang, "change_lang"), callback_data="toggle_lang")],
+        [
+            InlineKeyboardButton("🇺🇦 Українська", callback_data="set_lang:ua"),
+            InlineKeyboardButton("🇬🇧 English", callback_data="set_lang:en")
+        ],
         [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]
     ]
-    await update.message.reply_text(get_text(lang, "settings"), reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(get_text(lang, "settings"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -542,8 +611,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_user_lang(user_id) or "ua"
     keyboard = [
         [InlineKeyboardButton(get_text(lang, "admin_add_admin_btn"), callback_data="admin_add_admin")],
-        [InlineKeyboardButton(get_text(lang, "admin_add_channel_btn"), callback_data="admin_add_channel")],
         [InlineKeyboardButton(get_text(lang, "admin_list_channels_btn"), callback_data="admin_list_channels")],
+        [InlineKeyboardButton(get_text(lang, "admin_cookies_btn"), callback_data="admin_cookies")],
         [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]
     ]
     await update.message.reply_text(get_text(lang, "admin_title"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -606,25 +675,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     data = query.data
 
-    # First-run language setting
     if data.startswith("set_lang:"):
         selected_lang = data.split(":")[1]
         set_user_lang(user_id, selected_lang)
         await query.edit_message_text(get_text(selected_lang, "lang_set"))
-        await query.message.reply_text(get_text(selected_lang, "start"))
         return
 
     lang = get_user_lang(user_id) or "ua"
 
     if data == "close_menu":
         await query.message.delete()
-        return
-
-    if data == "toggle_lang":
-        new_lang = "en" if lang == "ua" else "ua"
-        set_user_lang(user_id, new_lang)
-        keyboard = [[InlineKeyboardButton(get_text(new_lang, "close_btn"), callback_data="close_menu")]]
-        await query.edit_message_text(get_text(new_lang, "lang_set"), reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if data == "check_subscription":
@@ -635,14 +695,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(get_text(lang, "sub_failed"), show_alert=True)
         return
 
-    # Admin Panel
     if data == "admin_menu":
         if not is_admin(user_id):
             return
         keyboard = [
             [InlineKeyboardButton(get_text(lang, "admin_add_admin_btn"), callback_data="admin_add_admin")],
-            [InlineKeyboardButton(get_text(lang, "admin_add_channel_btn"), callback_data="admin_add_channel")],
             [InlineKeyboardButton(get_text(lang, "admin_list_channels_btn"), callback_data="admin_list_channels")],
+            [InlineKeyboardButton(get_text(lang, "admin_cookies_btn"), callback_data="admin_cookies")],
             [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]
         ]
         await query.edit_message_text(get_text(lang, "admin_title"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -656,11 +715,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(get_text(lang, "admin_enter_admin_id"), reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
+    if data == "admin_cookies":
+        if not is_admin(user_id):
+            return
+        context.user_data["admin_state"] = "await_cookies"
+        keyboard = [[InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")]]
+        await query.edit_message_text(get_text(lang, "admin_enter_cookies"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
     if data == "admin_add_channel":
         if not is_admin(user_id):
             return
         context.user_data["admin_state"] = "await_channel_data"
-        keyboard = [[InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")]]
+        keyboard = [[InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_list_channels")]]
         await query.edit_message_text(
             get_text(lang, "admin_enter_channel_data"),
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -845,7 +912,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-async def handle_admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_admin_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         return
@@ -855,11 +922,31 @@ async def handle_admin_text_input(update: Update, context: ContextTypes.DEFAULT_
         return
 
     lang = get_user_lang(user_id) or "ua"
-    text = update.message.text.strip()
+
+    # Якщо адмін надіслав документ (cookies.txt)
+    if state == "await_cookies" and update.message.document:
+        doc = update.message.document
+        file = await context.bot.get_file(doc.file_id)
+        file_bytes = await file.download_as_bytearray()
+        content = file_bytes.decode('utf-8', errors='ignore')
+        save_db_cookies(content)
+        context.user_data["admin_state"] = None
+        await update.message.reply_text(get_text(lang, "cookies_updated"))
+        return
+
+    text = update.message.text.strip() if update.message.text else ""
+
+    if state == "await_cookies" and text:
+        save_db_cookies(text)
+        context.user_data["admin_state"] = None
+        await update.message.reply_text(get_text(lang, "cookies_updated"))
+        return
 
     if state == "await_admin_id":
         if text.isdigit():
-            add_admin(int(text))
+            new_admin_id = int(text)
+            add_admin(new_admin_id)
+            await setup_bot_commands(context.bot)
             await update.message.reply_text(get_text(lang, "admin_admin_added").format(id=text), parse_mode="Markdown")
             context.user_data["admin_state"] = None
         else:
@@ -897,13 +984,13 @@ telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("settings", settings_command))
 telegram_app.add_handler(CommandHandler("admin", admin_command))
 
-telegram_app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\d+$|^@"), handle_admin_text_input))
+telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_admin_inputs))
+telegram_app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\d+$|^@"), handle_admin_inputs))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_url))
 telegram_app.add_handler(CallbackQueryHandler(handle_callback))
 
 
 async def keep_alive_ping():
-    """Фонова задача для запобігання заснуванню веб-сервісу на Render."""
     await asyncio.sleep(10)
     while True:
         try:
@@ -918,7 +1005,7 @@ async def keep_alive_ping():
                 logger.info("Keep-alive ping to %s returned status %s", ping_url, status)
         except Exception as e:
             logger.warning("Keep-alive ping failed: %s", e)
-        await asyncio.sleep(600)  # Запит кожні 10 хвилин
+        await asyncio.sleep(600)
 
 
 @asynccontextmanager
@@ -927,6 +1014,9 @@ async def lifespan(app: FastAPI):
     start_bgutil_provider()
     await telegram_app.initialize()
     await telegram_app.start()
+    
+    await setup_bot_commands(telegram_app.bot)
+    
     await telegram_app.bot.set_webhook(
         url=WEBHOOK_URL,
         secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
