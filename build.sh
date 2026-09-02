@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Забороняємо Git запитувати логін/пароль в терміналі
+export GIT_TERMINAL_PROMPT=0
+
 echo "==> Installing local Node.js runtime..."
 NODE_VERSION="${NODE_VERSION:-22.20.0}"
 mkdir -p .node
@@ -15,7 +18,10 @@ python -m pip install -r requirements.txt
 
 echo "==> Building BgUtils PO-token provider..."
 rm -rf bgutil-ytdlp-pot-provider
-git clone --depth 1 --branch 1.3.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git bgutil-ytdlp-pot-provider
+
+# Клонуємо основну гілку main без прив'язки до відсутнього тегу
+git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git bgutil-ytdlp-pot-provider
+
 cd bgutil-ytdlp-pot-provider/server
 npm ci
 npx tsc
