@@ -17,8 +17,22 @@ echo "==> Downloading BgUtils PO-token provider source..."
 rm -rf bgutil-ytdlp-pot-provider
 mkdir -p bgutil-ytdlp-pot-provider
 
-# Завантажуємо та розпаковуємо архів напряму без використання git clone
-curl -fsSL https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C bgutil-ytdlp-pot-provider
+# Автоматична перевірка та вибір існуючої гілки або тегу
+TAR_URL=""
+for ref in "refs/heads/master" "refs/heads/main" "refs/tags/v1.3.1" "refs/tags/1.3.1"; do
+  if curl --output /dev/null --silent --head --fail "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/${ref}.tar.gz"; then
+    TAR_URL="https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/${ref}.tar.gz"
+    echo "==> Found archive at: ${ref}"
+    break
+  fi
+done
+
+if [ -z "$TAR_URL" ]; then
+  echo "❌ Error: Could not locate source archive on GitHub."
+  exit 1
+fi
+
+curl -fsSL "$TAR_URL" | tar -xz --strip-components=1 -C bgutil-ytdlp-pot-provider
 
 cd bgutil-ytdlp-pot-provider/server
 npm ci
