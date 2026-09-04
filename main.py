@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from datetime import datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -17,9 +18,10 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
     BotCommand,
-    BotCommandScopeAllPrivateChats,
-    BotCommandScopeChat
+    BotCommandScopeAllPrivateChats
 )
 from telegram.ext import (
     Application,
@@ -85,6 +87,9 @@ def execute_query(query: str, params: tuple = (), fetchone=False, fetchall=False
         sql = query
         if is_postgres:
             sql = sql.replace("?", "%s").replace("excluded.", "EXCLUDED.")
+            # Adjust auto-increment for Postgres
+            if "AUTOINCREMENT" in sql:
+                sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
         cursor.execute(sql, params)
         
         res = None
@@ -100,7 +105,6 @@ def execute_query(query: str, params: tuple = (), fetchone=False, fetchall=False
         conn.close()
 
 def sync_cookies_from_db():
-    """Синхронізує cookies з бази даних у локальний файл cookies.txt."""
     row = execute_query("SELECT value FROM settings WHERE key = ?", ("youtube_cookies",), fetchone=True)
     if row and row[0]:
         COOKIES_FILE_PATH.write_text(row[0], encoding="utf-8")
@@ -108,7 +112,6 @@ def sync_cookies_from_db():
         COOKIES_FILE_PATH.write_text(YOUTUBE_COOKIES, encoding="utf-8")
 
 def save_db_cookies(content: str):
-    """Зберігає cookies у базу даних та файл."""
     execute_query("""
         INSERT INTO settings (key, value) VALUES ('youtube_cookies', ?)
         ON CONFLICT (key) DO UPDATE SET value = excluded.value
@@ -116,6 +119,7 @@ def save_db_cookies(content: str):
     COOKIES_FILE_PATH.write_text(content, encoding="utf-8")
 
 def init_db():
+    # USERS
     execute_query("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -123,12 +127,34 @@ def init_db():
         )
     """, commit=True)
     
+    # Migrations for Users
+    try: execute_query("ALTER TABLE users ADD COLUMN username TEXT", commit=True)
+    except: pass
+    try: execute_query("ALTER TABLE users ADD COLUMN first_name TEXT", commit=True)
+    except: pass
+    try: execute_query("ALTER TABLE users ADD COLUMN downloads INTEGER DEFAULT 0", commit=True)
+    except: pass
+    try: execute_query("ALTER TABLE users ADD COLUMN is_banned BOOLEAN DEFAULT FALSE", commit=True)
+    except: pass
+    try: execute_query("ALTER TABLE users ADD COLUMN joined_date TEXT", commit=True)
+    except: pass
+
+    # ADMINS
     execute_query("""
         CREATE TABLE IF NOT EXISTS admins (
             user_id BIGINT PRIMARY KEY
         )
     """, commit=True)
     
+    # Migrations for Admins
+    try: execute_query("ALTER TABLE admins ADD COLUMN added_by BIGINT", commit=True)
+    except: pass
+    try: execute_query("ALTER TABLE admins ADD COLUMN added_date TEXT", commit=True)
+    except: pass
+    try: execute_query("ALTER TABLE admins ADD COLUMN username TEXT", commit=True)
+    except: pass
+
+    # CHANNELS
     execute_query("""
         CREATE TABLE IF NOT EXISTS channels (
             channel_id TEXT PRIMARY KEY,
@@ -137,6 +163,7 @@ def init_db():
         )
     """, commit=True)
 
+    # SETTINGS
     execute_query("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -144,25 +171,64 @@ def init_db():
         )
     """, commit=True)
     
+    # HISTORY
+    execute_query("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id BIGINT,
+            url TEXT,
+            download_date TEXT
+        )
+    """, commit=True)
+
     if INITIAL_ADMIN_ID > 0:
+        date_now = datetime.now().strftime("%Y-%m-%d %H:%M")
         execute_query("""
-            INSERT INTO admins (user_id) VALUES (?)
+            INSERT INTO admins (user_id, added_date, username) VALUES (?, ?, ?)
             ON CONFLICT (user_id) DO NOTHING
-        """, (INITIAL_ADMIN_ID,), commit=True)
+        """, (INITIAL_ADMIN_ID, date_now, "Owner"), commit=True)
 
     sync_cookies_from_db()
 
-def get_user_lang(user_id: int) -> str | None:
+
+# --- User & Admin DB Helpers ---
+
+def register_or_update_user(user_id: int, username: str, first_name: str, lang: str = "ua"):
+    date_now = datetime.now().strftime("%Y-%m-%d")
+    row = execute_query("SELECT user_id FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    if not row:
+        execute_query("""
+            INSERT INTO users (user_id, lang, username, first_name, joined_date, downloads, is_banned)
+            VALUES (?, ?, ?, ?, ?, 0, FALSE)
+        """, (user_id, lang, username, first_name, date_now), commit=True)
+    else:
+        execute_query("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", 
+                      (username, first_name, user_id), commit=True)
+
+def get_user_info(user_id: int):
+    return execute_query("SELECT * FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+
+def is_user_banned(user_id: int) -> bool:
+    row = execute_query("SELECT is_banned FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    return row[0] if row else False
+
+def set_user_ban(user_id: int, state: bool):
+    execute_query("UPDATE users SET is_banned = ? WHERE user_id = ?", (state, user_id), commit=True)
+
+def increment_downloads(user_id: int, url: str):
+    execute_query("UPDATE users SET downloads = downloads + 1 WHERE user_id = ?", (user_id,), commit=True)
+    date_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    execute_query("INSERT INTO history (user_id, url, download_date) VALUES (?, ?, ?)", (user_id, url, date_now), commit=True)
+
+def get_user_history(user_id: int, limit=5):
+    return execute_query("SELECT url, download_date FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit), fetchall=True)
+
+def get_user_lang(user_id: int) -> str:
     row = execute_query("SELECT lang FROM users WHERE user_id = ?", (user_id,), fetchone=True)
-    if row and row[0]:
-        return row[0]
-    return None
+    return row[0] if row and row[0] else "ua"
 
 def set_user_lang(user_id: int, lang: str):
-    execute_query("""
-        INSERT INTO users (user_id, lang) VALUES (?, ?)
-        ON CONFLICT (user_id) DO UPDATE SET lang = excluded.lang
-    """, (user_id, lang), commit=True)
+    execute_query("UPDATE users SET lang = ? WHERE user_id = ?", (lang, user_id), commit=True)
 
 def is_admin(user_id: int) -> bool:
     if user_id == INITIAL_ADMIN_ID:
@@ -170,30 +236,30 @@ def is_admin(user_id: int) -> bool:
     row = execute_query("SELECT user_id FROM admins WHERE user_id = ?", (user_id,), fetchone=True)
     return row is not None
 
-def add_admin(user_id: int):
+def add_admin(user_id: int, added_by: int, username: str = None):
+    date_now = datetime.now().strftime("%Y-%m-%d %H:%M")
     execute_query("""
-        INSERT INTO admins (user_id) VALUES (?)
+        INSERT INTO admins (user_id, added_by, added_date, username) VALUES (?, ?, ?, ?)
         ON CONFLICT (user_id) DO NOTHING
-    """, (user_id,), commit=True)
+    """, (user_id, added_by, date_now, username), commit=True)
 
-def get_all_admin_ids() -> list[int]:
-    rows = execute_query("SELECT user_id FROM admins", fetchall=True) or []
-    admins = {r[0] for r in rows}
-    if INITIAL_ADMIN_ID > 0:
-        admins.add(INITIAL_ADMIN_ID)
-    return list(admins)
+def remove_admin(user_id: int):
+    if user_id != INITIAL_ADMIN_ID:
+        execute_query("DELETE FROM admins WHERE user_id = ?", (user_id,), commit=True)
+
+def get_all_admins_info():
+    return execute_query("SELECT user_id, added_by, added_date, username FROM admins", fetchall=True)
+
+def get_admin_info(user_id: int):
+    return execute_query("SELECT user_id, added_by, added_date, username FROM admins WHERE user_id = ?", (user_id,), fetchone=True)
 
 def get_sponsored_channels():
     rows = execute_query("SELECT channel_id, title, invite_link FROM channels", fetchall=True)
-    if not rows:
-        return []
-    return [{"id": r[0], "title": r[1], "link": r[2]} for r in rows]
+    return [{"id": r[0], "title": r[1], "link": r[2]} for r in rows] if rows else []
 
 def get_sponsored_channel(channel_id: str):
     row = execute_query("SELECT channel_id, title, invite_link FROM channels WHERE channel_id = ?", (channel_id,), fetchone=True)
-    if row:
-        return {"id": row[0], "title": row[1], "link": row[2]}
-    return None
+    return {"id": row[0], "title": row[1], "link": row[2]} if row else None
 
 def add_sponsored_channel(channel_id: str, title: str, link: str):
     execute_query("""
@@ -202,9 +268,7 @@ def add_sponsored_channel(channel_id: str, title: str, link: str):
     """, (channel_id, title, link), commit=True)
 
 def update_sponsored_channel(channel_id: str, title: str, link: str):
-    execute_query("""
-        UPDATE channels SET title = ?, invite_link = ? WHERE channel_id = ?
-    """, (title, link, channel_id), commit=True)
+    execute_query("UPDATE channels SET title = ?, invite_link = ? WHERE channel_id = ?", (title, link, channel_id), commit=True)
 
 def delete_sponsored_channel(channel_id: str):
     execute_query("DELETE FROM channels WHERE channel_id = ?", (channel_id,), commit=True)
@@ -216,96 +280,171 @@ def delete_sponsored_channel(channel_id: str):
 
 TEXTS = {
     "ua": {
+        "btn_settings": "⚙️ Налаштування",
+        "btn_profile": "👤 Профіль",
+        "btn_admin": "🔑 Адмін меню",
         "start": "Привіт! 👋\nНадішли посилання на YouTube або YouTube Music.\nМожна відео, трек або плейлист.",
         "choose_format": "Обери формат:",
         "audio_btn": "🎵 Аудіо",
         "video_btn": "🎬 Відео",
         "download_audio": "🎵 Завантажити аудіо",
-        "settings": "⚙️ **Налаштування**\nОберіть бажану мову інтерфейсу:",
-        "change_lang": "🌐 Змінити мову",
+        
+        "settings_main": "⚙️ **Налаштування**\nОберіть потрібний розділ:",
+        "lang_menu_btn": "🌐 Мова",
+        "settings_lang": "Оберіть бажану мову інтерфейсу:",
         "lang_set": "✅ Мову успішно змінено на Українську 🇺🇦",
+        
+        "profile_text": "👤 **Профіль користувача**\n\n**Ім'я:** {name}\n**ID:** `{id}`\n**Статус:** {status}\n**Дата реєстрації:** {date}\n**Завантажень:** {downloads}",
+        "status_user": "Користувач 👤",
+        "status_admin": "Адміністратор 👑",
+        
         "sub_required": "⚠️ **Для використання бота підпишіться на наші канали-спонсори:**",
         "check_sub_btn": "🔄 Перевірити підписку",
         "sub_success": "✅ Дякуємо за підписку! Надішліть посилання ще раз.",
         "sub_failed": "❌ Ви підписалися не на всі канали!",
         "invalid_url": "❌ Надішли коректне посилання YouTube або YouTube Music.",
+        "banned_text": "❌ Ваш акаунт заблоковано. Ви не можете користуватись ботом.",
+        
         "back_btn": "🔙 Назад",
+        "cancel_btn": "❌ Скасувати",
         "close_btn": "❌ Закрити",
+        
         "fetching_qualities": "🔎 Отримую список доступних якостей...",
         "no_qualities": "❌ Не вдалося отримати варіанти якості для цього відео.",
         "choose_quality": "📹 **{title}**\n\nОберіть бажану якість:",
         "downloading_video": "⏳ Завантажую відео у якості {height}p...",
         "downloading_audio": "⏳ Завантажую аудіо та обкладинку...",
-        "file_too_large_video": "📦 **Файл перевищує 50 МБ** ({mb} МБ).\nTelegram не дозволяє надсилати такі файли напряму.\n\n🔗 [Натисніть сюди, щоб завантажити відео]({link})",
+        "file_too_large_video": "📦 **Файл перевищує 50 МБ** ({mb} МБ).\n\n🔗 [Натисніть сюди, щоб завантажити відео]({link})",
         "file_too_large_audio": "📦 **Аудіо перевищує 50 МБ** ({mb} МБ).\n\n🔗 [Натисніть сюди, щоб завантажити аудіо]({link})",
         "link_lost": "❌ Посилання втрачено. Надішли його ще раз.",
+        
+        # Адмін панель
         "admin_title": "🔑 **Панель адміністратора**",
+        "admin_list_admins_btn": "👥 Список адмінів",
         "admin_add_admin_btn": "➕ Додати адміна",
         "admin_add_channel_btn": "📢 Додати спонсора",
         "admin_list_channels_btn": "📋 Список спонсорів",
+        "admin_users_btn": "🔍 Користувачі",
         "admin_cookies_btn": "🍪 Оновити Cookies",
+        
         "admin_enter_admin_id": "Надішліть Telegram ID користувача, якому хочете надати права адміна:",
-        "admin_enter_channel_data": "Надішліть дані каналу у такому форматі (через пробіл):\n`@channel_id Назва_Каналу https://t.me/link`\n\n⚠️ **Бот повинен бути доданий в цей канал як АДМІНІСТРАТОР!**",
-        "admin_enter_cookies": "🍪 Надішліть файл `cookies.txt` або його текстовий вміст у повідомленні:",
+        "admin_enter_channel_data": "Надішліть дані каналу:\n`@channel_id Назва_Каналу https://t.me/link`",
+        "admin_enter_cookies": "🍪 Надішліть файл `cookies.txt` або його текст.\n*(Зараз бот не реагує на інші посилання)*",
         "cookies_updated": "✅ Cookies успішно збережено в хмару та оновлено!",
-        "admin_channel_added": "✅ Канал `{title}` додано до списку спонсорів!",
+        "admin_channel_added": "✅ Канал `{title}` додано до спонсорів!",
         "admin_invalid_channel_format": "❌ Невірний формат. Введіть: `@channel_id Назва Посилання`",
-        "admin_admin_added": "✅ Користувача `{id}` успішно додано до адмінів!",
+        "admin_admin_added": "✅ Користувача успішно додано до адмінів!",
         "admin_invalid_id": "❌ Введіть числовий Telegram ID.",
+        
         "sponsors_empty": "📋 **Спонсорських каналів немає.**",
-        "sponsors_list_title": "📋 **Керування спонсорськими каналами:**",
+        "sponsors_list_title": "📋 **Керування спонсорами:**",
         "sponsor_info": "📢 **Канал:** {title}\n🆔 **ID:** `{id}`\n🔗 **Посилання:** {link}",
         "edit_btn": "✏️ Редагувати",
         "delete_btn": "🗑 Видалити",
-        "sponsor_deleted": "✅ Канал успішно видалено!",
+        "sponsor_deleted": "✅ Канал видалено!",
         "edit_sponsor_prompt": "Надішліть нову назву та посилання через пробіл:\n`Нова_Назва https://t.me/link`",
         "sponsor_updated": "✅ Дані каналу оновлено!",
+        
+        "admins_list_title": "👥 **Список адміністраторів:**",
+        "admin_info": "👑 **Адміністратор:** {name}\n🆔 **ID:** `{id}`\n📅 **Доданий:** {date}\n👤 **Ким доданий:** `{added_by}`",
+        "admin_deleted": "✅ Адміністратора видалено!",
+        "cant_delete_owner": "❌ Головного адміна видалити неможливо!",
+        
+        "admin_search_user_prompt": "🔍 Надішліть Telegram ID користувача для пошуку:",
+        "user_not_found": "❌ Користувача з таким ID не знайдено в базі.",
+        "user_info_admin": "👤 **Профіль:** {name}\n🆔 **ID:** `{id}`\n📅 **Реєстрація:** {date}\n📥 **Завантажень:** {downloads}\n🚫 **Бан:** {banned}",
+        "ban_btn": "🚫 Забанити",
+        "unban_btn": "✅ Розбанити",
+        "history_btn": "🕒 Історія",
+        "user_banned_success": "✅ Користувача забанено.",
+        "user_unbanned_success": "✅ Користувача розбанено.",
+        "user_history_title": "🕒 **Останні завантаження ({id}):**\n",
+        "user_history_empty": "Історія порожня.",
+        
+        "action_cancelled": "✅ Дія скасована."
     },
     "en": {
+        "btn_settings": "⚙️ Settings",
+        "btn_profile": "👤 Profile",
+        "btn_admin": "🔑 Admin Panel",
         "start": "Hello! 👋\nSend a YouTube or YouTube Music link.\nVideo, track, or playlist supported.",
         "choose_format": "Choose format:",
         "audio_btn": "🎵 Audio",
         "video_btn": "🎬 Video",
         "download_audio": "🎵 Download audio",
-        "settings": "⚙️ **Settings**\nSelect your preferred interface language:",
-        "change_lang": "🌐 Change language",
+        
+        "settings_main": "⚙️ **Settings**\nSelect a section:",
+        "lang_menu_btn": "🌐 Language",
+        "settings_lang": "Select your preferred interface language:",
         "lang_set": "✅ Language successfully set to English 🇬🇧",
-        "sub_required": "⚠️ **Please subscribe to our sponsor channels to use the bot:**",
+        
+        "profile_text": "👤 **User Profile**\n\n**Name:** {name}\n**ID:** `{id}`\n**Status:** {status}\n**Joined:** {date}\n**Downloads:** {downloads}",
+        "status_user": "User 👤",
+        "status_admin": "Administrator 👑",
+        
+        "sub_required": "⚠️ **Please subscribe to our sponsor channels:**",
         "check_sub_btn": "🔄 Check subscription",
         "sub_success": "✅ Thank you for subscribing! Please send the link again.",
         "sub_failed": "❌ You have not subscribed to all channels!",
         "invalid_url": "❌ Please send a valid YouTube or YouTube Music link.",
+        "banned_text": "❌ Your account is banned. You cannot use this bot.",
+        
         "back_btn": "🔙 Back",
+        "cancel_btn": "❌ Cancel",
         "close_btn": "❌ Close",
+        
         "fetching_qualities": "🔎 Fetching available video qualities...",
         "no_qualities": "❌ Could not get quality options for this video.",
         "choose_quality": "📹 **{title}**\n\nChoose desired quality:",
         "downloading_video": "⏳ Downloading video in {height}p quality...",
         "downloading_audio": "⏳ Downloading audio & cover art...",
-        "file_too_large_video": "📦 **File exceeds 50 MB** ({mb} MB).\nTelegram doesn't allow direct sending of large files.\n\n🔗 [Click here to download video]({link})",
+        "file_too_large_video": "📦 **File exceeds 50 MB** ({mb} MB).\n\n🔗 [Click here to download video]({link})",
         "file_too_large_audio": "📦 **Audio exceeds 50 MB** ({mb} MB).\n\n🔗 [Click here to download audio]({link})",
         "link_lost": "❌ Link lost. Please send it again.",
+        
         "admin_title": "🔑 **Admin Panel**",
+        "admin_list_admins_btn": "👥 Admins List",
         "admin_add_admin_btn": "➕ Add Admin",
         "admin_add_channel_btn": "📢 Add Sponsor",
         "admin_list_channels_btn": "📋 Sponsor List",
+        "admin_users_btn": "🔍 Users",
         "admin_cookies_btn": "🍪 Update Cookies",
-        "admin_enter_admin_id": "Send the Telegram ID of the user you want to promote to admin:",
-        "admin_enter_channel_data": "Send channel details in this format (space separated):\n`@channel_id Channel_Name https://t.me/link`\n\n⚠️ **Bot must be an ADMIN in this channel!**",
-        "admin_enter_cookies": "🍪 Send the `cookies.txt` file or paste its content as a message:",
-        "cookies_updated": "✅ Cookies successfully saved to cloud & updated!",
-        "admin_channel_added": "✅ Channel `{title}` added to sponsors!",
-        "admin_invalid_channel_format": "❌ Invalid format. Enter: `@channel_id Name Link`",
-        "admin_admin_added": "✅ User `{id}` added as admin!",
+        
+        "admin_enter_admin_id": "Send the Telegram ID to promote to admin:",
+        "admin_enter_channel_data": "Send channel details:\n`@channel_id Name https://t.me/link`",
+        "admin_enter_cookies": "🍪 Send the `cookies.txt` file or paste text.\n*(Bot ignores YouTube links in this state)*",
+        "cookies_updated": "✅ Cookies successfully saved!",
+        "admin_channel_added": "✅ Channel added to sponsors!",
+        "admin_invalid_channel_format": "❌ Invalid format.",
+        "admin_admin_added": "✅ User added as admin!",
         "admin_invalid_id": "❌ Please enter a numeric Telegram ID.",
+        
         "sponsors_empty": "📋 **No sponsor channels found.**",
-        "sponsors_list_title": "📋 **Sponsor Channel Management:**",
+        "sponsors_list_title": "📋 **Sponsors Management:**",
         "sponsor_info": "📢 **Channel:** {title}\n🆔 **ID:** `{id}`\n🔗 **Link:** {link}",
         "edit_btn": "✏️ Edit",
         "delete_btn": "🗑 Delete",
-        "sponsor_deleted": "✅ Channel successfully deleted!",
-        "edit_sponsor_prompt": "Send new name and link space-separated:\n`New_Name https://t.me/link`",
-        "sponsor_updated": "✅ Channel details updated!",
+        "sponsor_deleted": "✅ Channel deleted!",
+        "edit_sponsor_prompt": "Send new name and link:\n`New_Name https://t.me/link`",
+        "sponsor_updated": "✅ Channel updated!",
+        
+        "admins_list_title": "👥 **Administrators List:**",
+        "admin_info": "👑 **Admin:** {name}\n🆔 **ID:** `{id}`\n📅 **Added:** {date}\n👤 **Added by:** `{added_by}`",
+        "admin_deleted": "✅ Admin removed!",
+        "cant_delete_owner": "❌ Cannot remove the main owner!",
+        
+        "admin_search_user_prompt": "🔍 Send Telegram ID to search:",
+        "user_not_found": "❌ User not found in DB.",
+        "user_info_admin": "👤 **Profile:** {name}\n🆔 **ID:** `{id}`\n📅 **Joined:** {date}\n📥 **Downloads:** {downloads}\n🚫 **Banned:** {banned}",
+        "ban_btn": "🚫 Ban",
+        "unban_btn": "✅ Unban",
+        "history_btn": "🕒 History",
+        "user_banned_success": "✅ User banned.",
+        "user_unbanned_success": "✅ User unbanned.",
+        "user_history_title": "🕒 **Recent Downloads ({id}):**\n",
+        "user_history_empty": "History is empty.",
+        
+        "action_cancelled": "✅ Action cancelled."
     }
 }
 
@@ -315,48 +454,23 @@ def get_text(lang: str, key: str) -> str:
 
 
 # =========================================================
-# HELPER: COMMAND AUTOCOMPLETE & LANGUAGE CHECK
+# KEYBOARDS & COMMANDS
 # =========================================================
 
 async def setup_bot_commands(app_bot):
-    user_commands = [
-        BotCommand("start", "Запустити / Restart"),
-        BotCommand("settings", "Налаштування / Settings")
+    # Only leaving technical restart, standard UI is buttons
+    await app_bot.set_my_commands([BotCommand("start", "Restart / Запустити")], scope=BotCommandScopeAllPrivateChats())
+
+def get_main_keyboard(user_id: int, lang: str) -> ReplyKeyboardMarkup:
+    keys = [
+        [KeyboardButton(get_text(lang, "btn_settings")), KeyboardButton(get_text(lang, "btn_profile"))]
     ]
-    await app_bot.set_my_commands(user_commands, scope=BotCommandScopeAllPrivateChats())
+    if is_admin(user_id):
+        keys.append([KeyboardButton(get_text(lang, "btn_admin"))])
+    return ReplyKeyboardMarkup(keys, resize_keyboard=True)
 
-    admin_commands = [
-        BotCommand("start", "Запустити / Restart"),
-        BotCommand("settings", "Налаштування / Settings"),
-        BotCommand("admin", "Панель адміністратора / Admin Panel")
-    ]
-    for admin_id in get_all_admin_ids():
-        try:
-            await app_bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
-        except Exception as e:
-            logger.warning("Could not set admin commands for %s: %s", admin_id, e)
-
-def get_language_selection_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🇺🇦 Українська", callback_data="set_lang:ua"),
-            InlineKeyboardButton("🇬🇧 English", callback_data="set_lang:en")
-        ]
-    ])
-
-async def check_user_language_or_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
-    user_id = update.effective_user.id
-    lang = get_user_lang(user_id)
-    
-    if lang is None:
-        text = "👋 Вітаємо! Будь ласка, оберіть мову:\n👋 Welcome! Please choose a language:"
-        if update.callback_query:
-            await update.callback_query.message.reply_text(text, reply_markup=get_language_selection_keyboard())
-        elif update.message:
-            await update.message.reply_text(text, reply_markup=get_language_selection_keyboard())
-        return None
-        
-    return lang
+def get_cancel_inline(lang: str, callback_data: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "cancel_btn"), callback_data=callback_data)]])
 
 
 # =========================================================
@@ -380,7 +494,7 @@ async def check_user_subscriptions(bot, user_id: int):
 
 
 # =========================================================
-# YT-DLP CORE LOGIC
+# YT-DLP CORE LOGIC (UNCHANGED)
 # =========================================================
 
 def youtube_options_base():
@@ -389,11 +503,7 @@ def youtube_options_base():
         "fragment_retries": 3,
         "socket_timeout": 30,
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         },
         "extractor_args": {
@@ -413,14 +523,11 @@ def youtube_options_base():
 
 def start_bgutil_provider():
     global BGUTIL_PROCESS
-    if not BGUTIL_MAIN.is_file():
-        return False
-    node = LOCAL_NODE_BIN / "node"
-    if not node.is_file():
+    if not BGUTIL_MAIN.is_file() or not (LOCAL_NODE_BIN / "node").is_file():
         return False
 
     BGUTIL_PROCESS = subprocess.Popen(
-        [str(node), str(BGUTIL_MAIN), "--port", str(BGUTIL_PORT)],
+        [str(LOCAL_NODE_BIN / "node"), str(BGUTIL_MAIN), "--port", str(BGUTIL_PORT)],
         cwd=str(BGUTIL_DIR),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
@@ -440,7 +547,6 @@ def start_bgutil_provider():
             time.sleep(0.25)
     return False
 
-
 def stop_bgutil_provider():
     global BGUTIL_PROCESS
     if BGUTIL_PROCESS is not None and BGUTIL_PROCESS.poll() is None:
@@ -451,38 +557,18 @@ def stop_bgutil_provider():
             BGUTIL_PROCESS.kill()
     BGUTIL_PROCESS = None
 
-
 def human_youtube_error(error: Exception) -> str:
     text = str(error)
     if "Sign in to confirm you’re not a bot" in text:
         return "YouTube заблокував запит (anti-bot). Оновіть cookies в адмін-панелі."
     return text[:1000]
 
-
-# =========================================================
-# LOGGING
-# =========================================================
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-if not TOKEN or not PUBLIC_URL:
-    raise RuntimeError("BOT_TOKEN or PUBLIC_URL is missing!")
-
-WEBHOOK_URL = f"{PUBLIC_URL}/telegram/webhook"
-
-
 def is_youtube_url(url: str) -> bool:
     pattern = r"^https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/"
     return bool(re.match(pattern, url, re.IGNORECASE))
 
-
 def is_youtube_music_url(url: str) -> bool:
     return bool(re.match(r"^https?://music\.youtube\.com/", url, re.IGNORECASE))
-
 
 def get_video_formats_info(url: str):
     options = youtube_options_base()
@@ -520,11 +606,8 @@ def get_video_formats_info(url: str):
 
     return available_qualities, info.get("title", "video")
 
-
 def download_audio(url: str, workdir: str):
     output = str(Path(workdir) / "%(title).80s.%(ext)s")
-    
-    # Основний конфіг з конвертацією обкладинки .webp -> .jpg
     options = youtube_options_base()
     options.update({
         "format": "bestaudio/best",
@@ -534,23 +617,10 @@ def download_audio(url: str, workdir: str):
         "quiet": True,
         "no_warnings": True,
         "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "128",
-            },
-            {
-                "key": "FFmpegThumbnailsConvertor",
-                "format": "jpg",
-            },
-            {
-                "key": "FFmpegMetadata",
-                "add_metadata": True,
-            },
-            {
-                "key": "EmbedThumbnail",
-                "already_have_thumbnail": False,
-            },
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"},
+            {"key": "FFmpegThumbnailsConvertor", "format": "jpg"},
+            {"key": "FFmpegMetadata", "add_metadata": True},
+            {"key": "EmbedThumbnail", "already_have_thumbnail": False},
         ],
     })
 
@@ -559,15 +629,11 @@ def download_audio(url: str, workdir: str):
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
             mp3_file = str(Path(filename).with_suffix(".mp3"))
-            if os.path.exists(mp3_file):
-                return mp3_file, info
+            if os.path.exists(mp3_file): return mp3_file, info
             mp3_files = list(Path(workdir).glob("*.mp3"))
-            if mp3_files:
-                return str(mp3_files[0]), info
+            if mp3_files: return str(mp3_files[0]), info
     except Exception as e:
-        logger.warning("Не вдалося вшити обкладинку (%s). Завантажуємо MP3 без обкладинки...", e)
-        
-        # Резервний режим: завантаження чистого MP3 без обкладинки
+        logger.warning("Cover embed failed (%s). Fallback to clean MP3...", e)
         fallback_options = youtube_options_base()
         fallback_options.update({
             "format": "bestaudio/best",
@@ -577,29 +643,19 @@ def download_audio(url: str, workdir: str):
             "quiet": True,
             "no_warnings": True,
             "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "128",
-                },
-                {
-                    "key": "FFmpegMetadata",
-                    "add_metadata": True,
-                },
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"},
+                {"key": "FFmpegMetadata", "add_metadata": True},
             ],
         })
         with YoutubeDL(fallback_options) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
             mp3_file = str(Path(filename).with_suffix(".mp3"))
-            if os.path.exists(mp3_file):
-                return mp3_file, info
+            if os.path.exists(mp3_file): return mp3_file, info
             mp3_files = list(Path(workdir).glob("*.mp3"))
-            if mp3_files:
-                return str(mp3_files[0]), info
+            if mp3_files: return str(mp3_files[0]), info
 
-    raise FileNotFoundError("MP3 файл не знайдено.")
-
+    raise FileNotFoundError("MP3 file not found.")
 
 def download_video_quality(url: str, workdir: str, height: int):
     output = str(Path(workdir) / "%(title).80s.%(ext)s")
@@ -618,14 +674,22 @@ def download_video_quality(url: str, workdir: str, height: int):
         filename = ydl.prepare_filename(info)
         mp4_file = str(Path(filename).with_suffix(".mp4"))
         
-        if os.path.exists(mp4_file):
-            return mp4_file, info
-        
+        if os.path.exists(mp4_file): return mp4_file, info
         video_files = [p for p in Path(workdir).iterdir() if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm"}]
-        if video_files:
-            return str(video_files[0]), info
-            
-        raise FileNotFoundError("Відеофайл не знайдено.")
+        if video_files: return str(video_files[0]), info
+        raise FileNotFoundError("Video file not found.")
+
+
+# =========================================================
+# LOGGING
+# =========================================================
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+if not TOKEN or not PUBLIC_URL:
+    raise RuntimeError("BOT_TOKEN or PUBLIC_URL is missing!")
+WEBHOOK_URL = f"{PUBLIC_URL}/telegram/webhook"
 
 
 # =========================================================
@@ -633,73 +697,85 @@ def download_video_quality(url: str, workdir: str, height: int):
 # =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = await check_user_language_or_ask(update, context)
-    if lang is None:
-        return
-    await update.message.reply_text(get_text(lang, "start"))
-
-
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = await check_user_language_or_ask(update, context)
-    if lang is None:
-        return
+    user = update.effective_user
+    username = user.username or ""
+    first_name = user.first_name or ""
+    register_or_update_user(user.id, username, first_name)
     
-    keyboard = [
-        [
-            InlineKeyboardButton("🇺🇦 Українська", callback_data="set_lang:ua"),
-            InlineKeyboardButton("🇬🇧 English", callback_data="set_lang:en")
-        ],
-        [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]
-    ]
-    await update.message.reply_text(get_text(lang, "settings"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    lang = get_user_lang(user.id)
+    await update.message.reply_text(
+        get_text(lang, "start"),
+        reply_markup=get_main_keyboard(user.id, lang)
+    )
 
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
+async def master_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text.strip() if update.message.text else ""
+    
+    register_or_update_user(user.id, user.username or "", user.first_name or "")
+    
+    if is_user_banned(user.id):
+        lang = get_user_lang(user.id)
+        await update.message.reply_text(get_text(lang, "banned_text"))
         return
 
-    lang = get_user_lang(user_id) or "ua"
-    keyboard = [
-        [InlineKeyboardButton(get_text(lang, "admin_add_admin_btn"), callback_data="admin_add_admin")],
-        [InlineKeyboardButton(get_text(lang, "admin_list_channels_btn"), callback_data="admin_list_channels")],
-        [InlineKeyboardButton(get_text(lang, "admin_cookies_btn"), callback_data="admin_cookies")],
-        [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]
-    ]
-    await update.message.reply_text(get_text(lang, "admin_title"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-
-
-async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    lang = get_user_lang(user.id)
+    
+    # 1. Захист від посилань під час очікування введення від адміна (напр. Cookies)
+    admin_state = context.user_data.get("admin_state")
+    if admin_state:
+        await handle_admin_inputs(update, context, text, admin_state, lang)
         return
 
-    lang = await check_user_language_or_ask(update, context)
-    if lang is None:
+    # 2. Кнопки головного меню
+    if text in [TEXTS["ua"]["btn_settings"], TEXTS["en"]["btn_settings"]]:
+        keyboard = [
+            [InlineKeyboardButton(get_text(lang, "lang_menu_btn"), callback_data="settings_lang")],
+            [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]
+        ]
+        await update.message.reply_text(get_text(lang, "settings_main"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
-
-    url = update.message.text.strip()
-    user_id = update.effective_user.id
-
-    unsubscribed = await check_user_subscriptions(context.bot, user_id)
-    if unsubscribed:
-        keyboard = []
-        for ch in unsubscribed:
-            keyboard.append([InlineKeyboardButton(f"👉 {ch['title']}", url=ch['link'])])
-        keyboard.append([InlineKeyboardButton(get_text(lang, "check_sub_btn"), callback_data="check_subscription")])
         
-        await update.message.reply_text(
-            get_text(lang, "sub_required"),
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
+    if text in [TEXTS["ua"]["btn_profile"], TEXTS["en"]["btn_profile"]]:
+        info = get_user_info(user.id)
+        status = get_text(lang, "status_admin") if is_admin(user.id) else get_text(lang, "status_user")
+        profile_msg = get_text(lang, "profile_text").format(
+            name=info[3] or info[2] or "User",
+            id=user.id,
+            status=status,
+            date=info[6] if len(info)>6 else "-",
+            downloads=info[4] if len(info)>4 else 0
         )
+        await update.message.reply_text(profile_msg, parse_mode="Markdown")
         return
 
-    if not is_youtube_url(url):
-        await update.message.reply_text(get_text(lang, "invalid_url"))
+    if text in [TEXTS["ua"]["btn_admin"], TEXTS["en"]["btn_admin"]]:
+        if not is_admin(user.id): return
+        keyboard = [
+            [InlineKeyboardButton(get_text(lang, "admin_list_admins_btn"), callback_data="admin_list_admins")],
+            [InlineKeyboardButton(get_text(lang, "admin_users_btn"), callback_data="admin_users")],
+            [InlineKeyboardButton(get_text(lang, "admin_list_channels_btn"), callback_data="admin_list_channels")],
+            [InlineKeyboardButton(get_text(lang, "admin_cookies_btn"), callback_data="admin_cookies")],
+            [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]
+        ]
+        await update.message.reply_text(get_text(lang, "admin_title"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
-    context.user_data["url"] = url
-    await send_format_selection(update.message, url, lang)
+    # 3. Обробка посилань Youtube
+    if text:
+        unsubscribed = await check_user_subscriptions(context.bot, user.id)
+        if unsubscribed:
+            keyboard = [[InlineKeyboardButton(f"👉 {ch['title']}", url=ch['link'])] for ch in unsubscribed]
+            keyboard.append([InlineKeyboardButton(get_text(lang, "check_sub_btn"), callback_data="check_subscription")])
+            await update.message.reply_text(get_text(lang, "sub_required"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            return
+
+        if not is_youtube_url(text):
+            await update.message.reply_text(get_text(lang, "invalid_url"))
+            return
+
+        context.user_data["url"] = text
+        await send_format_selection(update.message, text, lang)
 
 
 async def send_format_selection(message, url: str, lang: str, is_edit=False):
@@ -725,17 +801,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = update.effective_user.id
     data = query.data
+    lang = get_user_lang(user_id)
 
-    if data.startswith("set_lang:"):
-        selected_lang = data.split(":")[1]
-        set_user_lang(user_id, selected_lang)
-        await query.edit_message_text(get_text(selected_lang, "lang_set"))
+    if is_user_banned(user_id):
+        await query.edit_message_text(get_text(lang, "banned_text"))
         return
 
-    lang = get_user_lang(user_id) or "ua"
-
     if data == "close_menu":
+        context.user_data["admin_state"] = None
         await query.message.delete()
+        return
+        
+    if data == "cancel_admin_action":
+        context.user_data["admin_state"] = None
+        await query.edit_message_text(get_text(lang, "action_cancelled"))
+        return
+        
+    if data == "cancel_to_admin_menu":
+        context.user_data["admin_state"] = None
+        data = "admin_menu"
+
+    if data == "settings_lang":
+        keyboard = [
+            [InlineKeyboardButton("🇺🇦 Українська", callback_data="set_lang:ua"), InlineKeyboardButton("🇬🇧 English", callback_data="set_lang:en")],
+            [InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="settings_main")]
+        ]
+        await query.edit_message_text(get_text(lang, "settings_lang"), reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+        
+    if data == "settings_main":
+        keyboard = [[InlineKeyboardButton(get_text(lang, "lang_menu_btn"), callback_data="settings_lang")], [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]]
+        await query.edit_message_text(get_text(lang, "settings_main"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    if data.startswith("set_lang:"):
+        new_lang = data.split(":")[1]
+        set_user_lang(user_id, new_lang)
+        await query.message.delete()
+        await query.message.reply_text(get_text(new_lang, "lang_set"), reply_markup=get_main_keyboard(user_id, new_lang))
         return
 
     if data == "check_subscription":
@@ -746,11 +849,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(get_text(lang, "sub_failed"), show_alert=True)
         return
 
-    if data == "admin_menu":
-        if not is_admin(user_id):
-            return
+    # --- ADMIN CALLBACKS ---
+    if data == "admin_menu" and is_admin(user_id):
         keyboard = [
-            [InlineKeyboardButton(get_text(lang, "admin_add_admin_btn"), callback_data="admin_add_admin")],
+            [InlineKeyboardButton(get_text(lang, "admin_list_admins_btn"), callback_data="admin_list_admins")],
+            [InlineKeyboardButton(get_text(lang, "admin_users_btn"), callback_data="admin_users")],
             [InlineKeyboardButton(get_text(lang, "admin_list_channels_btn"), callback_data="admin_list_channels")],
             [InlineKeyboardButton(get_text(lang, "admin_cookies_btn"), callback_data="admin_cookies")],
             [InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")]
@@ -758,109 +861,157 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(get_text(lang, "admin_title"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
-    if data == "admin_add_admin":
-        if not is_admin(user_id):
-            return
-        context.user_data["admin_state"] = "await_admin_id"
-        keyboard = [[InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")]]
-        await query.edit_message_text(get_text(lang, "admin_enter_admin_id"), reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    if data == "admin_cookies":
-        if not is_admin(user_id):
-            return
-        context.user_data["admin_state"] = "await_cookies"
-        keyboard = [[InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")]]
-        await query.edit_message_text(get_text(lang, "admin_enter_cookies"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-        return
-
-    if data == "admin_add_channel":
-        if not is_admin(user_id):
-            return
-        context.user_data["admin_state"] = "await_channel_data"
-        keyboard = [[InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_list_channels")]]
-        await query.edit_message_text(
-            get_text(lang, "admin_enter_channel_data"),
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-        return
-
-    if data == "admin_list_channels":
-        if not is_admin(user_id):
-            return
-        channels = get_sponsored_channels()
+    if data == "admin_list_admins" and is_admin(user_id):
+        admins = get_all_admins_info()
         keyboard = []
-        if channels:
-            for ch in channels:
-                keyboard.append([InlineKeyboardButton(f"📢 {ch['title']}", callback_data=f"sp_view:{ch['id']}")])
+        for adm in admins:
+            name = adm[3] or f"ID: {adm[0]}"
+            keyboard.append([InlineKeyboardButton(f"👑 {name}", callback_data=f"adm_view:{adm[0]}")])
+        keyboard.append([InlineKeyboardButton(get_text(lang, "admin_add_admin_btn"), callback_data="admin_add_admin")])
+        keyboard.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
+        await query.edit_message_text(get_text(lang, "admins_list_title"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
         
+    if data.startswith("adm_view:") and is_admin(user_id):
+        adm_id = int(data.split(":")[1])
+        info = get_admin_info(adm_id)
+        if not info: return
+        text = get_text(lang, "admin_info").format(name=info[3] or "Unknown", id=info[0], date=info[2] or "-", added_by=info[1] or "-")
+        keyboard = []
+        if adm_id != INITIAL_ADMIN_ID:
+            keyboard.append([InlineKeyboardButton(get_text(lang, "delete_btn"), callback_data=f"adm_del:{adm_id}")])
+        keyboard.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_list_admins")])
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+        
+    if data.startswith("adm_del:") and is_admin(user_id):
+        adm_id = int(data.split(":")[1])
+        if adm_id == INITIAL_ADMIN_ID:
+            await query.answer(get_text(lang, "cant_delete_owner"), show_alert=True)
+            return
+        remove_admin(adm_id)
+        await query.answer(get_text(lang, "admin_deleted"), show_alert=True)
+        # return to list
+        admins = get_all_admins_info()
+        keyboard = [[InlineKeyboardButton(f"👑 {adm[3] or adm[0]}", callback_data=f"adm_view:{adm[0]}")] for adm in admins]
+        keyboard.append([InlineKeyboardButton(get_text(lang, "admin_add_admin_btn"), callback_data="admin_add_admin"), InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
+        await query.edit_message_text(get_text(lang, "admins_list_title"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    if data == "admin_add_admin" and is_admin(user_id):
+        context.user_data["admin_state"] = "await_admin_id"
+        await query.edit_message_text(get_text(lang, "admin_enter_admin_id"), reply_markup=get_cancel_inline(lang, "cancel_to_admin_menu"))
+        return
+
+    if data == "admin_cookies" and is_admin(user_id):
+        context.user_data["admin_state"] = "await_cookies"
+        await query.edit_message_text(get_text(lang, "admin_enter_cookies"), reply_markup=get_cancel_inline(lang, "cancel_to_admin_menu"), parse_mode="Markdown")
+        return
+        
+    if data == "admin_users" and is_admin(user_id):
+        context.user_data["admin_state"] = "await_user_search"
+        await query.edit_message_text(get_text(lang, "admin_search_user_prompt"), reply_markup=get_cancel_inline(lang, "cancel_to_admin_menu"))
+        return
+        
+    if data.startswith("usr_ban:") and is_admin(user_id):
+        target_id = int(data.split(":")[1])
+        set_user_ban(target_id, True)
+        await query.answer(get_text(lang, "user_banned_success"), show_alert=True)
+        # rebuild user view
+        data = f"usr_view:{target_id}"
+        
+    if data.startswith("usr_unban:") and is_admin(user_id):
+        target_id = int(data.split(":")[1])
+        set_user_ban(target_id, False)
+        await query.answer(get_text(lang, "user_unbanned_success"), show_alert=True)
+        data = f"usr_view:{target_id}"
+
+    if data.startswith("usr_view:") and is_admin(user_id):
+        target_id = int(data.split(":")[1])
+        info = get_user_info(target_id)
+        if not info:
+            await query.answer(get_text(lang, "user_not_found"), show_alert=True)
+            return
+        
+        banned = info[5]
+        text = get_text(lang, "user_info_admin").format(
+            name=info[3] or info[2] or "User", id=info[0], date=info[6] if len(info)>6 else "-", downloads=info[4] if len(info)>4 else 0,
+            banned="🔴 Так" if banned else "🟢 Ні"
+        )
+        keyboard = [[InlineKeyboardButton(get_text(lang, "history_btn"), callback_data=f"usr_hist:{target_id}")]]
+        if banned: keyboard[0].append(InlineKeyboardButton(get_text(lang, "unban_btn"), callback_data=f"usr_unban:{target_id}"))
+        else: keyboard[0].append(InlineKeyboardButton(get_text(lang, "ban_btn"), callback_data=f"usr_ban:{target_id}"))
+        keyboard.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_users")])
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+        
+    if data.startswith("usr_hist:") and is_admin(user_id):
+        target_id = int(data.split(":")[1])
+        hist = get_user_history(target_id, 10)
+        text = get_text(lang, "user_history_title").format(id=target_id)
+        if not hist:
+            text += get_text(lang, "user_history_empty")
+        else:
+            for i, h in enumerate(hist):
+                text += f"{i+1}. `{h[1]}`\n🔗 {h[0]}\n"
+        
+        keyboard = [[InlineKeyboardButton(get_text(lang, "back_btn"), callback_data=f"usr_view:{target_id}")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown", disable_web_page_preview=True)
+        return
+
+    if data == "admin_add_channel" and is_admin(user_id):
+        context.user_data["admin_state"] = "await_channel_data"
+        await query.edit_message_text(get_text(lang, "admin_enter_channel_data"), reply_markup=get_cancel_inline(lang, "admin_list_channels"), parse_mode="Markdown")
+        return
+
+    if data == "admin_list_channels" and is_admin(user_id):
+        channels = get_sponsored_channels()
+        keyboard = [[InlineKeyboardButton(f"📢 {ch['title']}", callback_data=f"sp_view:{ch['id']}")] for ch in channels]
         keyboard.append([InlineKeyboardButton(get_text(lang, "admin_add_channel_btn"), callback_data="admin_add_channel")])
         keyboard.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
-        
         text = get_text(lang, "sponsors_list_title") if channels else get_text(lang, "sponsors_empty")
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
-    if data.startswith("sp_view:"):
-        if not is_admin(user_id):
-            return
+    if data.startswith("sp_view:") and is_admin(user_id):
         ch_id = data.split(":", 1)[1]
         ch = get_sponsored_channel(ch_id)
-        if not ch:
-            await query.answer("❌ Канал не знайдено!", show_alert=True)
-            return
-
+        if not ch: return
         text = get_text(lang, "sponsor_info").format(title=ch['title'], id=ch['id'], link=ch['link'])
         keyboard = [
-            [
-                InlineKeyboardButton(get_text(lang, "edit_btn"), callback_data=f"sp_edit:{ch_id}"),
-                InlineKeyboardButton(get_text(lang, "delete_btn"), callback_data=f"sp_del:{ch_id}")
-            ],
+            [InlineKeyboardButton(get_text(lang, "edit_btn"), callback_data=f"sp_edit:{ch_id}"), InlineKeyboardButton(get_text(lang, "delete_btn"), callback_data=f"sp_del:{ch_id}")],
             [InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_list_channels")]
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
-    if data.startswith("sp_del:"):
-        if not is_admin(user_id):
-            return
+    if data.startswith("sp_del:") and is_admin(user_id):
         ch_id = data.split(":", 1)[1]
         delete_sponsored_channel(ch_id)
         await query.answer(get_text(lang, "sponsor_deleted"), show_alert=True)
-        
+        # redirect to list
         channels = get_sponsored_channels()
-        keyboard = []
-        if channels:
-            for ch in channels:
-                keyboard.append([InlineKeyboardButton(f"📢 {ch['title']}", callback_data=f"sp_view:{ch['id']}")])
-        keyboard.append([InlineKeyboardButton(get_text(lang, "admin_add_channel_btn"), callback_data="admin_add_channel")])
-        keyboard.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
-        
-        text = get_text(lang, "sponsors_list_title") if channels else get_text(lang, "sponsors_empty")
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        keyboard = [[InlineKeyboardButton(f"📢 {ch['title']}", callback_data=f"sp_view:{ch['id']}")] for ch in channels]
+        keyboard.append([InlineKeyboardButton(get_text(lang, "admin_add_channel_btn"), callback_data="admin_add_channel"), InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
+        await query.edit_message_text(get_text(lang, "sponsors_list_title") if channels else get_text(lang, "sponsors_empty"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
-    if data.startswith("sp_edit:"):
-        if not is_admin(user_id):
-            return
+    if data.startswith("sp_edit:") and is_admin(user_id):
         ch_id = data.split(":", 1)[1]
         context.user_data["admin_state"] = f"await_edit_channel:{ch_id}"
-        keyboard = [[InlineKeyboardButton(get_text(lang, "back_btn"), callback_data=f"sp_view:{ch_id}")]]
-        await query.edit_message_text(get_text(lang, "edit_sponsor_prompt"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.edit_message_text(get_text(lang, "edit_sponsor_prompt"), reply_markup=get_cancel_inline(lang, f"sp_view:{ch_id}"), parse_mode="Markdown")
         return
 
+    # --- DOWNLOAD LOGIC CALLBACKS ---
     if data == "back_to_format":
         url = context.user_data.get("url")
-        if url:
-            await send_format_selection(query.message, url, lang, is_edit=True)
-        else:
-            await query.edit_message_text(get_text(lang, "link_lost"))
+        if url: await send_format_selection(query.message, url, lang, is_edit=True)
+        else: await query.edit_message_text(get_text(lang, "link_lost"))
         return
 
     url = context.user_data.get("url")
     if not url:
-        await query.edit_message_text(get_text(lang, "link_lost"))
         return
 
     if data == "video":
@@ -871,19 +1022,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status.edit_text(get_text(lang, "no_qualities"))
                 return
 
-            keyboard = []
-            for q in qualities:
-                size_str = f"~{q['size_mb']} МБ" if q['size_mb'] > 0 else "?"
-                btn_text = f"🎬 {q['height']}p ({size_str})"
-                keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"vdl:{q['height']}")])
-
+            keyboard = [[InlineKeyboardButton(f"🎬 {q['height']}p (~{q['size_mb']} МБ)", callback_data=f"vdl:{q['height']}")] for q in qualities]
             keyboard.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="back_to_format")])
-
-            await status.edit_text(
-                get_text(lang, "choose_quality").format(title=title[:60]),
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            await status.edit_text(get_text(lang, "choose_quality").format(title=title[:60]), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         except Exception as error:
             logger.exception("Format fetch failed")
             await status.edit_text(f"❌ {human_youtube_error(error)}")
@@ -893,32 +1034,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         height = int(data.split(":")[1])
         status = await query.edit_message_text(get_text(lang, "downloading_video").format(height=height))
         workdir = tempfile.mkdtemp(prefix="yt_tg_")
-
         try:
             filepath, info = await asyncio.to_thread(download_video_quality, url, workdir, height)
             file_size = os.path.getsize(filepath)
+            
+            increment_downloads(user_id, url)
 
             if file_size <= MAX_FILE_SIZE:
                 with open(filepath, "rb") as f:
-                    await context.bot.send_video(
-                        chat_id=query.message.chat_id,
-                        video=f,
-                        supports_streaming=True,
-                        duration=int(info.get("duration", 0)) or None,
-                    )
+                    await context.bot.send_video(chat_id=query.message.chat_id, video=f, supports_streaming=True, duration=int(info.get("duration", 0)) or None)
                 await status.delete()
             else:
                 safe_name = f"{int(time.time())}_{Path(filepath).name}"
-                web_path = DOWNLOADS_DIR / safe_name
-                shutil.move(filepath, web_path)
-
-                download_link = f"{PUBLIC_URL}/download/{safe_name}"
+                shutil.move(filepath, DOWNLOADS_DIR / safe_name)
                 mb_size = round(file_size / (1024 * 1024), 1)
-
-                await status.edit_text(
-                    get_text(lang, "file_too_large_video").format(mb=mb_size, link=download_link),
-                    parse_mode="Markdown"
-                )
+                await status.edit_text(get_text(lang, "file_too_large_video").format(mb=mb_size, link=f"{PUBLIC_URL}/download/{safe_name}"), parse_mode="Markdown")
         except Exception as error:
             logger.exception("Download failed")
             await status.edit_text(f"❌ {human_youtube_error(error)}")
@@ -932,29 +1062,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             filepath, info = await asyncio.to_thread(download_audio, url, workdir)
             file_size = os.path.getsize(filepath)
+            
+            increment_downloads(user_id, url)
 
             if file_size <= MAX_FILE_SIZE:
                 with open(filepath, "rb") as f:
-                    await context.bot.send_audio(
-                        chat_id=query.message.chat_id,
-                        audio=f,
-                        title=info.get("title", "audio")[:64],
-                        performer=info.get("artist") or info.get("uploader"),
-                        duration=int(info.get("duration", 0)) or None,
-                    )
+                    await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, title=info.get("title", "audio")[:64], performer=info.get("artist") or info.get("uploader"), duration=int(info.get("duration", 0)) or None)
                 await status.delete()
             else:
                 safe_name = f"{int(time.time())}_{Path(filepath).name}"
-                web_path = DOWNLOADS_DIR / safe_name
-                shutil.move(filepath, web_path)
-
-                download_link = f"{PUBLIC_URL}/download/{safe_name}"
+                shutil.move(filepath, DOWNLOADS_DIR / safe_name)
                 mb_size = round(file_size / (1024 * 1024), 1)
-
-                await status.edit_text(
-                    get_text(lang, "file_too_large_audio").format(mb=mb_size, link=download_link),
-                    parse_mode="Markdown"
-                )
+                await status.edit_text(get_text(lang, "file_too_large_audio").format(mb=mb_size, link=f"{PUBLIC_URL}/download/{safe_name}"), parse_mode="Markdown")
         except Exception as error:
             logger.exception("Download failed")
             await status.edit_text(f"❌ {human_youtube_error(error)}")
@@ -963,18 +1082,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-async def handle_admin_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_admin_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_admin(user_id):
-        return
-
+    if not is_admin(user_id): return
     state = context.user_data.get("admin_state")
-    if not state:
-        return
-
-    lang = get_user_lang(user_id) or "ua"
-
-    # Якщо адмін надіслав документ (cookies.txt)
+    lang = get_user_lang(user_id)
+    
     if state == "await_cookies" and update.message.document:
         doc = update.message.document
         file = await context.bot.get_file(doc.file_id)
@@ -983,33 +1096,55 @@ async def handle_admin_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE
         save_db_cookies(content)
         context.user_data["admin_state"] = None
         await update.message.reply_text(get_text(lang, "cookies_updated"))
-        return
 
-    text = update.message.text.strip() if update.message.text else ""
 
-    if state == "await_cookies" and text:
+async def handle_admin_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, state: str, lang: str):
+    user_id = update.effective_user.id
+    if not is_admin(user_id): return
+
+    if state == "await_cookies":
         save_db_cookies(text)
         context.user_data["admin_state"] = None
         await update.message.reply_text(get_text(lang, "cookies_updated"))
-        return
-
-    if state == "await_admin_id":
+        
+    elif state == "await_admin_id":
         if text.isdigit():
             new_admin_id = int(text)
-            add_admin(new_admin_id)
-            await setup_bot_commands(context.bot)
-            await update.message.reply_text(get_text(lang, "admin_admin_added").format(id=text), parse_mode="Markdown")
+            add_admin(new_admin_id, added_by=user_id)
             context.user_data["admin_state"] = None
+            await update.message.reply_text(get_text(lang, "admin_admin_added"))
+        else:
+            await update.message.reply_text(get_text(lang, "admin_invalid_id"))
+            
+    elif state == "await_user_search":
+        if text.isdigit():
+            target_id = int(text)
+            info = get_user_info(target_id)
+            if not info:
+                await update.message.reply_text(get_text(lang, "user_not_found"))
+                return
+            context.user_data["admin_state"] = None
+            
+            banned = info[5]
+            profile_text = get_text(lang, "user_info_admin").format(
+                name=info[3] or info[2] or "User", id=info[0], date=info[6] if len(info)>6 else "-", downloads=info[4] if len(info)>4 else 0,
+                banned="🔴 Так" if banned else "🟢 Ні"
+            )
+            keyboard = [[InlineKeyboardButton(get_text(lang, "history_btn"), callback_data=f"usr_hist:{target_id}")]]
+            if banned: keyboard[0].append(InlineKeyboardButton(get_text(lang, "unban_btn"), callback_data=f"usr_unban:{target_id}"))
+            else: keyboard[0].append(InlineKeyboardButton(get_text(lang, "ban_btn"), callback_data=f"usr_ban:{target_id}"))
+            keyboard.append([InlineKeyboardButton(get_text(lang, "close_btn"), callback_data="close_menu")])
+            
+            await update.message.reply_text(profile_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         else:
             await update.message.reply_text(get_text(lang, "admin_invalid_id"))
 
     elif state == "await_channel_data":
         parts = text.split(maxsplit=2)
         if len(parts) == 3:
-            ch_id, title, link = parts
-            add_sponsored_channel(ch_id, title, link)
-            await update.message.reply_text(get_text(lang, "admin_channel_added").format(title=title), parse_mode="Markdown")
+            add_sponsored_channel(parts[0], parts[1], parts[2])
             context.user_data["admin_state"] = None
+            await update.message.reply_text(get_text(lang, "admin_channel_added").format(title=parts[1]), parse_mode="Markdown")
         else:
             await update.message.reply_text(get_text(lang, "admin_invalid_channel_format"))
 
@@ -1017,10 +1152,9 @@ async def handle_admin_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE
         ch_id = state.split(":", 1)[1]
         parts = text.split(maxsplit=1)
         if len(parts) == 2:
-            title, link = parts
-            update_sponsored_channel(ch_id, title, link)
-            await update.message.reply_text(get_text(lang, "sponsor_updated"), parse_mode="Markdown")
+            update_sponsored_channel(ch_id, parts[0], parts[1])
             context.user_data["admin_state"] = None
+            await update.message.reply_text(get_text(lang, "sponsor_updated"))
         else:
             await update.message.reply_text("❌ Формат: `Назва Посилання`")
 
@@ -1032,12 +1166,10 @@ async def handle_admin_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE
 telegram_app = Application.builder().token(TOKEN).updater(None).build()
 
 telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(CommandHandler("settings", settings_command))
-telegram_app.add_handler(CommandHandler("admin", admin_command))
+# Видалено команди /settings та /admin, тепер все через master_text_handler
 
-telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_admin_inputs))
-telegram_app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\d+$|^@"), handle_admin_inputs))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_url))
+telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_admin_doc))
+telegram_app.add_handler(MessageHandler(filters.TEXT, master_text_handler))
 telegram_app.add_handler(CallbackQueryHandler(handle_callback))
 
 
