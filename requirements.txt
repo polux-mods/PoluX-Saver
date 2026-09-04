@@ -1,7 +1,7 @@
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.34,<1.0
 python-telegram-bot>=22.0,<23.0
-yt-dlp>=2024.12.23
+yt-dlp==2026.8.19
 bgutil-ytdlp-pot-provider==1.3.1
 yt-dlp-ejs==0.8.0
 requests>=2.32.0
