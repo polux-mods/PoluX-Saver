@@ -59,6 +59,7 @@ if LOCAL_NODE_BIN.is_dir():
 
 MAX_FILE_SIZE = 49 * 1024 * 1024
 COOKIES_FILE_PATH = BASE_DIR / "cookies.txt"
+OAUTH_CACHE_PATH = BASE_DIR / "youtube_oauth_cache.json"
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 
 DOWNLOADS_DIR = BASE_DIR / "downloads"
@@ -87,7 +88,6 @@ def execute_query(query: str, params: tuple = (), fetchone=False, fetchall=False
         sql = query
         if is_postgres:
             sql = sql.replace("?", "%s").replace("excluded.", "EXCLUDED.")
-            # Adjust auto-increment for Postgres
             if "AUTOINCREMENT" in sql:
                 sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
         cursor.execute(sql, params)
@@ -111,6 +111,11 @@ def sync_cookies_from_db():
     elif YOUTUBE_COOKIES:
         COOKIES_FILE_PATH.write_text(YOUTUBE_COOKIES, encoding="utf-8")
 
+    # Синхронізація токенів OAuth2 із бази даних
+    oauth_row = execute_query("SELECT value FROM settings WHERE key = ?", ("youtube_oauth",), fetchone=True)
+    if oauth_row and oauth_row[0]:
+        OAUTH_CACHE_PATH.write_text(oauth_row[0], encoding="utf-8")
+
 def save_db_cookies(content: str):
     execute_query("""
         INSERT INTO settings (key, value) VALUES ('youtube_cookies', ?)
@@ -118,8 +123,15 @@ def save_db_cookies(content: str):
     """, (content,), commit=True)
     COOKIES_FILE_PATH.write_text(content, encoding="utf-8")
 
+def save_db_oauth():
+    if OAUTH_CACHE_PATH.is_file():
+        content = OAUTH_CACHE_PATH.read_text(encoding="utf-8")
+        execute_query("""
+            INSERT INTO settings (key, value) VALUES ('youtube_oauth', ?)
+            ON CONFLICT (key) DO UPDATE SET value = excluded.value
+        """, (content,), commit=True)
+
 def init_db():
-    # USERS
     execute_query("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -127,7 +139,6 @@ def init_db():
         )
     """, commit=True)
     
-    # Migrations for Users
     try: execute_query("ALTER TABLE users ADD COLUMN username TEXT", commit=True)
     except: pass
     try: execute_query("ALTER TABLE users ADD COLUMN first_name TEXT", commit=True)
@@ -139,14 +150,12 @@ def init_db():
     try: execute_query("ALTER TABLE users ADD COLUMN joined_date TEXT", commit=True)
     except: pass
 
-    # ADMINS
     execute_query("""
         CREATE TABLE IF NOT EXISTS admins (
             user_id BIGINT PRIMARY KEY
         )
     """, commit=True)
     
-    # Migrations for Admins
     try: execute_query("ALTER TABLE admins ADD COLUMN added_by BIGINT", commit=True)
     except: pass
     try: execute_query("ALTER TABLE admins ADD COLUMN added_date TEXT", commit=True)
@@ -154,7 +163,6 @@ def init_db():
     try: execute_query("ALTER TABLE admins ADD COLUMN username TEXT", commit=True)
     except: pass
 
-    # CHANNELS
     execute_query("""
         CREATE TABLE IF NOT EXISTS channels (
             channel_id TEXT PRIMARY KEY,
@@ -163,7 +171,6 @@ def init_db():
         )
     """, commit=True)
 
-    # SETTINGS
     execute_query("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -171,7 +178,6 @@ def init_db():
         )
     """, commit=True)
     
-    # HISTORY
     execute_query("""
         CREATE TABLE IF NOT EXISTS history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -318,7 +324,6 @@ TEXTS = {
         "file_too_large_audio": "📦 **Аудіо перевищує 50 МБ** ({mb} МБ).\n\n🔗 [Натисніть сюди, щоб завантажити аудіо]({link})",
         "link_lost": "❌ Посилання втрачено. Надішли його ще раз.",
         
-        # Адмін панель
         "admin_title": "🔑 **Панель адміністратора**",
         "admin_list_admins_btn": "👥 Список адмінів",
         "admin_add_admin_btn": "➕ Додати адміна",
@@ -458,7 +463,6 @@ def get_text(lang: str, key: str) -> str:
 # =========================================================
 
 async def setup_bot_commands(app_bot):
-    # Only leaving technical restart, standard UI is buttons
     await app_bot.set_my_commands([BotCommand("start", "Restart / Запустити")], scope=BotCommandScopeAllPrivateChats())
 
 def get_main_keyboard(user_id: int, lang: str) -> ReplyKeyboardMarkup:
@@ -494,20 +498,22 @@ async def check_user_subscriptions(bot, user_id: int):
 
 
 # =========================================================
-# YT-DLP CORE LOGIC (UNCHANGED)
+# YT-DLP CORE LOGIC
 # =========================================================
 
 def youtube_options_base():
     options = {
-        "retries": 3,
-        "fragment_retries": 3,
+        "retries": 5,
+        "fragment_retries": 5,
         "socket_timeout": 30,
+        "username": "oauth2",
+        "oauth2_cache_file": str(OAUTH_CACHE_PATH),
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         },
         "extractor_args": {
-            "youtube": {"player_client": ["android_vr", "mweb"]},
+            "youtube": {"player_client": ["android", "ios", "web"]},
             "youtubepot-bgutilhttp": {"base_url": f"http://127.0.0.1:{BGUTIL_PORT}"},
         },
         "js_runtimes": {
@@ -559,8 +565,8 @@ def stop_bgutil_provider():
 
 def human_youtube_error(error: Exception) -> str:
     text = str(error)
-    if "Sign in to confirm you’re not a bot" in text:
-        return "YouTube заблокував запит (anti-bot). Оновіть cookies в адмін-панелі."
+    if "Sign in to confirm you’re not a bot" in text or "Sign in to confirm you are not a bot" in text:
+        return "YouTube заблокував запит (anti-bot). Система оновлює автоматичний доступ, спробуйте ще раз через декілька секунд."
     return text[:1000]
 
 def is_youtube_url(url: str) -> bool:
@@ -576,6 +582,7 @@ def get_video_formats_info(url: str):
     
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=False)
+        save_db_oauth()
         
     formats = info.get("formats", [])
     
@@ -627,6 +634,7 @@ def download_audio(url: str, workdir: str):
     try:
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
+            save_db_oauth()
             filename = ydl.prepare_filename(info)
             mp3_file = str(Path(filename).with_suffix(".mp3"))
             if os.path.exists(mp3_file): return mp3_file, info
@@ -649,6 +657,7 @@ def download_audio(url: str, workdir: str):
         })
         with YoutubeDL(fallback_options) as ydl:
             info = ydl.extract_info(url, download=True)
+            save_db_oauth()
             filename = ydl.prepare_filename(info)
             mp3_file = str(Path(filename).with_suffix(".mp3"))
             if os.path.exists(mp3_file): return mp3_file, info
@@ -671,6 +680,7 @@ def download_video_quality(url: str, workdir: str, height: int):
     
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
+        save_db_oauth()
         filename = ydl.prepare_filename(info)
         mp4_file = str(Path(filename).with_suffix(".mp4"))
         
@@ -721,13 +731,11 @@ async def master_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     lang = get_user_lang(user.id)
     
-    # 1. Захист від посилань під час очікування введення від адміна (напр. Cookies)
     admin_state = context.user_data.get("admin_state")
     if admin_state:
         await handle_admin_inputs(update, context, text, admin_state, lang)
         return
 
-    # 2. Кнопки головного меню
     if text in [TEXTS["ua"]["btn_settings"], TEXTS["en"]["btn_settings"]]:
         keyboard = [
             [InlineKeyboardButton(get_text(lang, "lang_menu_btn"), callback_data="settings_lang")],
@@ -761,7 +769,6 @@ async def master_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(get_text(lang, "admin_title"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
-    # 3. Обробка посилань Youtube
     if text:
         unsubscribed = await check_user_subscriptions(context.bot, user.id)
         if unsubscribed:
@@ -891,7 +898,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         remove_admin(adm_id)
         await query.answer(get_text(lang, "admin_deleted"), show_alert=True)
-        # return to list
         admins = get_all_admins_info()
         keyboard = [[InlineKeyboardButton(f"👑 {adm[3] or adm[0]}", callback_data=f"adm_view:{adm[0]}")] for adm in admins]
         keyboard.append([InlineKeyboardButton(get_text(lang, "admin_add_admin_btn"), callback_data="admin_add_admin"), InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
@@ -917,7 +923,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = int(data.split(":")[1])
         set_user_ban(target_id, True)
         await query.answer(get_text(lang, "user_banned_success"), show_alert=True)
-        # rebuild user view
         data = f"usr_view:{target_id}"
         
     if data.startswith("usr_unban:") and is_admin(user_id):
@@ -990,7 +995,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ch_id = data.split(":", 1)[1]
         delete_sponsored_channel(ch_id)
         await query.answer(get_text(lang, "sponsor_deleted"), show_alert=True)
-        # redirect to list
         channels = get_sponsored_channels()
         keyboard = [[InlineKeyboardButton(f"📢 {ch['title']}", callback_data=f"sp_view:{ch['id']}")] for ch in channels]
         keyboard.append([InlineKeyboardButton(get_text(lang, "admin_add_channel_btn"), callback_data="admin_add_channel"), InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="admin_menu")])
@@ -1166,8 +1170,6 @@ async def handle_admin_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE
 telegram_app = Application.builder().token(TOKEN).updater(None).build()
 
 telegram_app.add_handler(CommandHandler("start", start))
-# Видалено команди /settings та /admin, тепер все через master_text_handler
-
 telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_admin_doc))
 telegram_app.add_handler(MessageHandler(filters.TEXT, master_text_handler))
 telegram_app.add_handler(CallbackQueryHandler(handle_callback))
