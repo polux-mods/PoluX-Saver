@@ -17,6 +17,7 @@ echo "==> Downloading BgUtils PO-token provider source..."
 rm -rf bgutil-ytdlp-pot-provider
 mkdir -p bgutil-ytdlp-pot-provider
 
+# Автоматична перевірка та вибір існуючої гілки або тегу
 TAR_URL=""
 for ref in "refs/heads/master" "refs/heads/main" "refs/tags/v1.3.1" "refs/tags/1.3.1"; do
   if curl --output /dev/null --silent --head --fail "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/${ref}.tar.gz"; then
