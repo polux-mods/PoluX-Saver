@@ -1038,18 +1038,24 @@ WEBHOOK_URL = f"{PUBLIC_URL}/telegram/webhook"
 # TELEGRAM HANDLERS
 # =========================================================
 
-async def show_terms_prompt(message_or_query, lang: str):
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(get_text(lang, "terms_accept_btn"), callback_data="terms_accept"),
-            InlineKeyboardButton(get_text(lang, "terms_decline_btn"), callback_data="terms_decline")
-        ]
-    ])
-    text = get_text(lang, "terms_title")
-    if hasattr(message_or_query, "edit_text"):
-        await message_or_query.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+async def show_terms_prompt(message_or_query, lang):
+    text = "Текст вашої угоди/умов"  # ваш текст
+    keyboard = ...                  # ваша клавіатура
+
+    # Якщо це CallbackQuery (натискання на Inline-кнопку)
+    if hasattr(message_or_query, "edit_message_text"):
+        await message_or_query.edit_message_text(
+            text=text, 
+            reply_markup=keyboard, 
+            parse_mode="Markdown"
+        )
+    # Якщо це звичайне повідомлення від користувача (update.message)
     else:
-        await message_or_query.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        await message_or_query.reply_text(
+            text=text, 
+            reply_markup=keyboard, 
+            parse_mode="Markdown"
+        )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
