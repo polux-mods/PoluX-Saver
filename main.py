@@ -21,6 +21,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
     InlineQueryResultArticle,
     InputTextMessageContent,
 )
@@ -137,6 +138,8 @@ def init_db():
     except: pass
     try: execute_query("ALTER TABLE users ADD COLUMN joined_date TEXT", commit=True)
     except: pass
+    try: execute_query("ALTER TABLE users ADD COLUMN last_active TEXT", commit=True)
+    except: pass
 
     execute_query("""
         CREATE TABLE IF NOT EXISTS admins (
@@ -182,7 +185,6 @@ def init_db():
         )
     """, commit=True)
 
-    # Default settings for captions if not exist
     row = execute_query("SELECT value FROM settings WHERE key = 'caption_bot_enabled'", fetchone=True)
     if not row:
         execute_query("INSERT INTO settings (key, value) VALUES ('caption_bot_enabled', 'false')", commit=True)
@@ -203,21 +205,24 @@ def init_db():
 # --- User & Admin DB Helpers ---
 
 def register_or_update_user(user_id: int, username: str, first_name: str, lang: str = "ua"):
-    date_now = datetime.now().strftime("%Y-%m-%d")
+    date_now = datetime.now().strftime("%Y-%m-%d %H:%M")
     uname = username or ""
     fname = first_name or ""
     row = execute_query("SELECT user_id FROM users WHERE user_id = ?", (user_id,), fetchone=True)
     if not row:
         execute_query("""
-            INSERT INTO users (user_id, lang, username, first_name, joined_date, downloads, is_banned)
-            VALUES (?, ?, ?, ?, ?, 0, FALSE)
-        """, (user_id, lang, uname, fname, date_now), commit=True)
+            INSERT INTO users (user_id, lang, username, first_name, joined_date, downloads, is_banned, last_active)
+            VALUES (?, ?, ?, ?, ?, 0, FALSE, ?)
+        """, (user_id, lang, uname, fname, date_now, date_now), commit=True)
     else:
-        execute_query("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", 
-                      (uname, fname, user_id), commit=True)
+        execute_query("UPDATE users SET username = ?, first_name = ?, last_active = ? WHERE user_id = ?", 
+                      (uname, fname, date_now, user_id), commit=True)
 
 def get_user_info(user_id: int):
-    return execute_query("SELECT * FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    return execute_query("""
+        SELECT user_id, lang, username, first_name, downloads, is_banned, joined_date, last_active 
+        FROM users WHERE user_id = ?
+    """, (user_id,), fetchone=True)
 
 def is_user_banned(user_id: int) -> bool:
     row = execute_query("SELECT is_banned FROM users WHERE user_id = ?", (user_id,), fetchone=True)
@@ -286,7 +291,11 @@ def delete_sponsored_channel(channel_id: str):
 
 def get_users_page(page: int, limit: int = 10):
     offset = (page - 1) * limit
-    rows = execute_query("SELECT user_id, lang, username, first_name, downloads, is_banned, joined_date FROM users ORDER BY joined_date DESC, user_id DESC LIMIT ? OFFSET ?", (limit, offset), fetchall=True)
+    rows = execute_query("""
+        SELECT user_id, lang, username, first_name, downloads, is_banned, COALESCE(last_active, joined_date) 
+        FROM users 
+        ORDER BY COALESCE(last_active, joined_date) DESC, user_id DESC LIMIT ? OFFSET ?
+    """, (limit, offset), fetchall=True)
     total_rows = execute_query("SELECT COUNT(*) FROM users", fetchone=True)[0]
     total_pages = max(1, (total_rows + limit - 1) // limit)
     return rows, total_pages
@@ -339,7 +348,7 @@ TEXTS = {
         "settings_lang": "Оберіть бажану мову інтерфейсу:",
         "lang_set": "✅ Мову успішно змінено на Українську 🇺🇦",
         
-        "profile_text": "👤 **Профіль користувача**\n\n**Ім'я:** {name}\n**ID:** `{id}`\n**Статус:** {status}\n**Дата реєстрації:** {date}\n**Завантажень:** {downloads}",
+        "profile_text": "👤 **Профіль користувача**\n\n**Ім'я:** {name}\n**ID:** `{id}`\n**Статус:** {status}\n**Останній онлайн:** {last_active}\n**Завантажень:** {downloads}",
         "status_user": "Користувач 👤",
         "status_admin": "Адміністратор 👑",
         
@@ -363,7 +372,6 @@ TEXTS = {
         "file_too_large_audio": "📦 **Аудіо перевищує 50 МБ** ({mb} МБ).\n\n🔗 [Натисніть сюди, щоб завантажити аудіо]({link})",
         "link_lost": "❌ Посилання втрачено. Надішли його ще раз.",
         
-        # Адмін панель
         "admin_title": "🔑 **Панель адміністратора**",
         "admin_list_admins_btn": "👥 Список адмінів",
         "admin_add_admin_btn": "➕ Додати адміна",
@@ -400,7 +408,7 @@ TEXTS = {
         
         "admin_search_user_prompt": "🔍 Надішліть Telegram ID користувача для пошуку:",
         "user_not_found": "❌ Користувача з таким ID не знайдено в базі.",
-        "user_info_admin": "👤 **Профіль:** {name}\n🆔 **ID:** `{id}`\n📅 **Реєстрація:** {date}\n📥 **Завантажень:** {downloads}\n🚫 **Бан:** {banned}",
+        "user_info_admin": "👤 **Профіль:** {name}\n🆔 **ID:** `{id}`\n🕒 **Останній онлайн:** {last_active}\n📥 **Завантажень:** {downloads}\n🚫 **Бан:** {banned}",
         "ban_btn": "🚫 Забанити",
         "unban_btn": "✅ Розбанити",
         "history_btn": "🕒 Історія",
@@ -439,7 +447,7 @@ TEXTS = {
         "settings_lang": "Select your preferred interface language:",
         "lang_set": "✅ Language successfully set to English 🇬🇧",
         
-        "profile_text": "👤 **User Profile**\n\n**Name:** {name}\n**ID:** `{id}`\n**Status:** {status}\n**Joined:** {date}\n**Downloads:** {downloads}",
+        "profile_text": "👤 **User Profile**\n\n**Name:** {name}\n**ID:** `{id}`\n**Status:** {status}\n**Last active:** {last_active}\n**Downloads:** {downloads}",
         "status_user": "User 👤",
         "status_admin": "Administrator 👑",
         
@@ -499,7 +507,7 @@ TEXTS = {
         
         "admin_search_user_prompt": "🔍 Send Telegram ID to search:",
         "user_not_found": "❌ User not found in DB.",
-        "user_info_admin": "👤 **Profile:** {name}\n🆔 **ID:** `{id}`\n📅 **Joined:** {date}\n📥 **Downloads:** {downloads}\n🚫 **Banned:** {banned}",
+        "user_info_admin": "👤 **Profile:** {name}\n🆔 **ID:** `{id}`\n🕒 **Last active:** {last_active}\n📥 **Downloads:** {downloads}\n🚫 **Banned:** {banned}",
         "ban_btn": "🚫 Ban",
         "unban_btn": "✅ Unban",
         "history_btn": "🕒 History",
@@ -535,8 +543,13 @@ def get_text(lang: str, key: str) -> str:
 # =========================================================
 
 async def setup_bot_commands(app_bot):
-    # Прибираємо збоку підказки "/" (лишаємо тільки кнопки)
-    await app_bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
+    # Повне видалення підказок для команд 
+    try: await app_bot.delete_my_commands()
+    except: pass
+    try: await app_bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
+    except: pass
+    try: await app_bot.delete_my_commands(scope=BotCommandScopeDefault())
+    except: pass
 
 def get_main_keyboard(user_id: int, lang: str) -> ReplyKeyboardMarkup:
     keys = [
@@ -814,11 +827,14 @@ async def master_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if text in [TEXTS["ua"]["btn_profile"], TEXTS["en"]["btn_profile"]]:
         info = get_user_info(user.id)
         status = get_text(lang, "status_admin") if is_admin(user.id) else get_text(lang, "status_user")
+        
+        last_act = info[7] if (len(info) > 7 and info[7]) else (info[6] if len(info) > 6 else "-")
+        
         profile_msg = get_text(lang, "profile_text").format(
             name=info[3] or info[2] or f"ID: {user.id}",
             id=user.id,
             status=status,
-            date=info[6] if len(info)>6 else "-",
+            last_active=last_act,
             downloads=info[4] if len(info)>4 else 0
         )
         await update.message.reply_text(profile_msg, parse_mode="Markdown")
@@ -874,7 +890,12 @@ async def send_format_selection(message, url: str, lang: str, is_edit=False):
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
+    
+    user = update.effective_user
+    user_id = user.id
+    # Фіксуємо активність
+    register_or_update_user(user_id, user.username or "", user.first_name or "")
+    
     data = query.data
     lang = get_user_lang(user_id)
 
@@ -989,8 +1010,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_bot_on = bot_en and bot_en[0] == "true"
         new_state = "false" if is_bot_on else "true"
         execute_query("UPDATE settings SET value = ? WHERE key = 'caption_bot_enabled'", (new_state,), commit=True)
-        # return to caption menu
-        await handle_callback(update, context) # re-trigger admin_caption_menu or build view
+        await handle_callback(update, context) 
         return
 
     if data == "caption_set_custom" and is_admin(user_id):
@@ -1101,8 +1121,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         banned = info[5]
+        last_act = info[7] if (len(info) > 7 and info[7]) else (info[6] if len(info) > 6 else "-")
+        
         text = get_text(lang, "user_info_admin").format(
-            name=info[3] or info[2] or f"ID: {target_id}", id=info[0], date=info[6] if len(info)>6 else "-", downloads=info[4] if len(info)>4 else 0,
+            name=info[3] or info[2] or f"ID: {target_id}", 
+            id=info[0], 
+            last_active=last_act, 
+            downloads=info[4] if len(info)>4 else 0,
             banned="🔴 Так" if banned else "🟢 Ні"
         )
         keyboard = [[InlineKeyboardButton(get_text(lang, "history_btn"), callback_data=f"usr_hist:{target_id}")]]
@@ -1418,8 +1443,13 @@ async def handle_admin_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data["admin_state"] = None
             
             banned = info[5]
+            last_act = info[7] if (len(info) > 7 and info[7]) else (info[6] if len(info) > 6 else "-")
+            
             profile_text = get_text(lang, "user_info_admin").format(
-                name=info[3] or info[2] or f"ID: {target_id}", id=info[0], date=info[6] if len(info)>6 else "-", downloads=info[4] if len(info)>4 else 0,
+                name=info[3] or info[2] or f"ID: {target_id}", 
+                id=info[0], 
+                last_active=last_act, 
+                downloads=info[4] if len(info)>4 else 0,
                 banned="🔴 Так" if banned else "🟢 Ні"
             )
             keyboard = [[InlineKeyboardButton(get_text(lang, "history_btn"), callback_data=f"usr_hist:{target_id}")]]
